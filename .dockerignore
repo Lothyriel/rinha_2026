@@ -1,0 +1,7 @@
+target/
+spec/
+tests/
+!spec/resources/
+!spec/resources/**
+.git/
+.gitignore

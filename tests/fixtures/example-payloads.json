@@ -1,0 +1,131 @@
+[
+  {
+    "id": "tx-1329056812",
+    "transaction": {
+      "amount": 41.12,
+      "installments": 2,
+      "requested_at": "2026-03-11T18:45:53Z"
+    },
+    "customer": {
+      "avg_amount": 82.24,
+      "tx_count_24h": 3,
+      "known_merchants": ["MERC-003", "MERC-016"]
+    },
+    "merchant": {
+      "id": "MERC-016",
+      "mcc": "5411",
+      "avg_amount": 60.25
+    },
+    "terminal": {
+      "is_online": false,
+      "card_present": true,
+      "km_from_home": 29.2331036248
+    },
+    "last_transaction": null
+  },
+  {
+    "id": "tx-3576980410",
+    "transaction": {
+      "amount": 384.88,
+      "installments": 3,
+      "requested_at": "2026-03-11T20:23:35Z"
+    },
+    "customer": {
+      "avg_amount": 769.76,
+      "tx_count_24h": 3,
+      "known_merchants": ["MERC-009", "MERC-009", "MERC-001", "MERC-001"]
+    },
+    "merchant": {
+      "id": "MERC-001",
+      "mcc": "5912",
+      "avg_amount": 298.95
+    },
+    "terminal": {
+      "is_online": false,
+      "card_present": true,
+      "km_from_home": 13.7090520965
+    },
+    "last_transaction": {
+      "timestamp": "2026-03-11T14:58:35Z",
+      "km_from_current": 18.8626479774
+    }
+  },
+  {
+    "id": "tx-1788243118",
+    "transaction": {
+      "amount": 4368.82,
+      "installments": 8,
+      "requested_at": "2026-03-17T02:04:06Z"
+    },
+    "customer": {
+      "avg_amount": 68.88,
+      "tx_count_24h": 18,
+      "known_merchants": ["MERC-004", "MERC-004", "MERC-015", "MERC-017", "MERC-007"]
+    },
+    "merchant": {
+      "id": "MERC-062",
+      "mcc": "7801",
+      "avg_amount": 25.55
+    },
+    "terminal": {
+      "is_online": true,
+      "card_present": false,
+      "km_from_home": 881.6139684714
+    },
+    "last_transaction": {
+      "timestamp": "2026-03-17T01:58:06Z",
+      "km_from_current": 660.9200962961
+    }
+  },
+  {
+    "id": "tx-3330991687",
+    "transaction": {
+      "amount": 9505.97,
+      "installments": 10,
+      "requested_at": "2026-03-14T05:15:12Z"
+    },
+    "customer": {
+      "avg_amount": 81.28,
+      "tx_count_24h": 20,
+      "known_merchants": ["MERC-008", "MERC-007", "MERC-005"]
+    },
+    "merchant": {
+      "id": "MERC-068",
+      "mcc": "7802",
+      "avg_amount": 54.86
+    },
+    "terminal": {
+      "is_online": false,
+      "card_present": true,
+      "km_from_home": 952.2745933273
+    },
+    "last_transaction": null
+  },
+  {
+    "id": "tx-669205318",
+    "transaction": {
+      "amount": 8423.02,
+      "installments": 11,
+      "requested_at": "2026-03-24T06:54:04Z"
+    },
+    "customer": {
+      "avg_amount": 133.63,
+      "tx_count_24h": 19,
+      "known_merchants": ["MERC-002", "MERC-009", "MERC-005"]
+    },
+    "merchant": {
+      "id": "MERC-065",
+      "mcc": "7802",
+      "avg_amount": 76.23
+    },
+    "terminal": {
+      "is_online": true,
+      "card_present": false,
+      "km_from_home": 547.1032977912
+    },
+    "last_transaction": {
+      "timestamp": "2026-03-24T06:47:04Z",
+      "km_from_current": 788.2357740282
+    }
+  }
+]
