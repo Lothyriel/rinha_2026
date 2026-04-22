@@ -1,0 +1,16 @@
+{
+  "participants": [
+    "João Xavier"
+  ],
+  "social": [
+    "https://github.com/lothyriel/",
+    "https://www.linkedin.com/in/lothyriel"
+  ],
+  "source-code-repo": "https://github.com/lothyriel/rinha_2026",
+  "stack": [
+    "rust",
+    "nginx",
+    "unix sockets"
+  ],
+  "open_to_work": true
+}
