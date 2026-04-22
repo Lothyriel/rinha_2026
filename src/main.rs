@@ -1,12 +1,11 @@
 use std::{fs, net::SocketAddr, path::Path, sync::Arc};
 
-use rinha_2026::{app, detection};
+use rinha_2026::{app, detection, telemetry};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(
@@ -33,6 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         resources_dir.as_ref(),
         configured_search_backend,
     )?);
+
+    telemetry::install_from_env().map_err(std::io::Error::other)?;
 
     let reference_count = engine.reference_count();
     let active_search_backend = engine.search_backend_name();
@@ -112,9 +113,6 @@ async fn shutdown_signal() {
             }
         }
     };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
 
     tokio::select! {
         _ = ctrl_c => {},

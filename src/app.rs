@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use axum::{
     Json, Router,
@@ -7,11 +7,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use metrics::{counter, histogram};
 
-use crate::{
-    detection::{FraudEngine, FraudEngineError},
-    model::{FraudScoreRequest, FraudScoreResponse},
-};
+use crate::{detection::*, model::*};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -33,8 +31,18 @@ async fn fraud_score(
     State(state): State<AppState>,
     Json(payload): Json<FraudScoreRequest>,
 ) -> Result<Json<FraudScoreResponse>, AppError> {
-    let response = state.engine.score(&payload)?;
-    Ok(Json(response))
+    let start = Instant::now();
+
+    let result = state
+        .engine
+        .score(&payload)
+        .map(Json)
+        .map_err(AppError::from);
+
+    counter!("http_reqs",).increment(1);
+    histogram!("http_handler_time",).record(start.elapsed().as_micros() as f64);
+
+    result
 }
 
 pub enum AppError {
@@ -55,11 +63,24 @@ impl From<FraudEngineError> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            AppError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
-            AppError::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
-        };
+        let status = self.status_code();
+        let message = self.message();
 
         (status, Json(serde_json::json!({ "error": message }))).into_response()
+    }
+}
+
+impl AppError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    fn message(self) -> String {
+        match self {
+            AppError::BadRequest(message) | AppError::Unavailable(message) => message,
+        }
     }
 }

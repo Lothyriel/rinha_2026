@@ -3,15 +3,16 @@ use std::{
     fs::File,
     io::BufReader,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use flate2::read::GzDecoder;
+use metrics::histogram;
 use serde::Deserialize;
-use tracing::warn;
 use vicinity::hnsw::HNSWIndex;
 
-use crate::model::{FraudScoreRequest, FraudScoreResponse};
+use crate::model::*;
 
 const K_NEIGHBORS: usize = 5;
 const FRAUD_APPROVAL_THRESHOLD: f32 = 0.6;
@@ -26,7 +27,7 @@ pub enum FraudEngineError {
     Load(String),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct NormalizationConfig {
     pub max_amount: f32,
     pub max_installments: f32,
@@ -37,20 +38,20 @@ pub struct NormalizationConfig {
     pub max_merchant_avg_amount: f32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct RawReferenceEntry {
     vector: [f32; 14],
     label: ReferenceLabel,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum ReferenceLabel {
     Fraud,
     Legit,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct StoredReference {
     vector: [f32; 14],
     is_fraud: bool,
@@ -130,8 +131,22 @@ impl FraudEngine {
         &self,
         request: &FraudScoreRequest,
     ) -> Result<FraudScoreResponse, FraudEngineError> {
+        let vectorize_start = Instant::now();
+
         let vector = self.vectorize(request)?;
-        let (neighbor_count, fraud_votes) = self.classify_nearest_neighbors(&vector, K_NEIGHBORS);
+
+        histogram!("score_engine", "step" => "vectorize")
+            .record(vectorize_start.elapsed().as_micros() as f64);
+
+        let classify_start = Instant::now();
+
+        let (neighbor_count, fraud_votes) = self.classify_knn(&vector, K_NEIGHBORS);
+
+        histogram!(
+            "score_engine",
+            "step" => "classify"
+        )
+        .record(classify_start.elapsed().as_micros() as f64);
 
         if neighbor_count == 0 {
             return Err(FraudEngineError::Unavailable(
@@ -158,71 +173,51 @@ impl FraudEngine {
         }
     }
 
-    fn vectorize(&self, request: &FraudScoreRequest) -> Result<[f32; 14], FraudEngineError> {
-        let _transaction_id = &request.id;
-        let requested_at = parse_utc_timestamp(&request.transaction.requested_at)?;
-        let amount = clamp_ratio(
-            request.transaction.amount as f32,
-            self.normalization.max_amount,
-        );
+    fn vectorize(&self, req: &FraudScoreRequest) -> Result<[f32; 14], FraudEngineError> {
+        let requested_at = parse_utc_timestamp(&req.transaction.requested_at)?;
+
+        let amount = clamp_ratio(req.transaction.amount as f32, self.normalization.max_amount);
+
         let installments = clamp_ratio(
-            request.transaction.installments as f32,
+            req.transaction.installments as f32,
             self.normalization.max_installments,
         );
+
         let amount_vs_avg = normalize_amount_vs_avg(
-            request.transaction.amount as f32,
-            request.customer.avg_amount as f32,
+            req.transaction.amount as f32,
+            req.customer.avg_amount as f32,
             self.normalization.amount_vs_avg_ratio,
         );
+
         let hour_of_day = requested_at.hour() as f32 / 23.0;
         let day_of_week = requested_at.weekday().num_days_from_monday() as f32 / 6.0;
 
-        let (minutes_since_last_tx, km_from_last_tx) = match &request.last_transaction {
-            Some(last_transaction) => {
-                let last_timestamp = parse_utc_timestamp(&last_transaction.timestamp)?;
-                let elapsed_seconds = requested_at
-                    .signed_duration_since(last_timestamp)
-                    .num_seconds()
-                    .max(0) as f32;
+        let (minutes_since_last_tx, km_from_last_tx) = self.get_last_tx_data(req, requested_at)?;
 
-                (
-                    clamp_ratio(elapsed_seconds / 60.0, self.normalization.max_minutes),
-                    clamp_ratio(
-                        last_transaction.km_from_current as f32,
-                        self.normalization.max_km,
-                    ),
-                )
-            }
-            None => (-1.0, -1.0),
-        };
-
-        let km_from_home = clamp_ratio(
-            request.terminal.km_from_home as f32,
-            self.normalization.max_km,
-        );
+        let km_from_home = clamp_ratio(req.terminal.km_from_home as f32, self.normalization.max_km);
         let tx_count_24h = clamp_ratio(
-            request.customer.tx_count_24h as f32,
+            req.customer.tx_count_24h as f32,
             self.normalization.max_tx_count_24h,
         );
-        let is_online = bool_to_unit(request.terminal.is_online);
-        let card_present = bool_to_unit(request.terminal.card_present);
-        let unknown_merchant = if request
+
+        let is_online = bool_to_unit(req.terminal.is_online);
+        let card_present = bool_to_unit(req.terminal.card_present);
+
+        let unknown_merchant = if req
             .customer
             .known_merchants
             .iter()
-            .any(|known_merchant| known_merchant == &request.merchant.id)
+            .any(|known_merchant| known_merchant == &req.merchant.id)
         {
             0.0
         } else {
             1.0
         };
-        let mcc_risk = self
-            .mcc_risk
-            .get(&request.merchant.mcc)
-            .copied()
-            .unwrap_or(0.5);
+
+        let mcc_risk = self.mcc_risk.get(&req.merchant.mcc).copied().unwrap_or(0.5);
+
         let merchant_avg_amount = clamp_ratio(
-            request.merchant.avg_amount as f32,
+            req.merchant.avg_amount as f32,
             self.normalization.max_merchant_avg_amount,
         );
 
@@ -244,40 +239,50 @@ impl FraudEngine {
         ])
     }
 
-    fn classify_nearest_neighbors(&self, query: &[f32; 14], neighbors: usize) -> (usize, usize) {
-        if let SearchIndex::Hnsw(search_index) = &self.search_index {
-            let normalized_query = normalize_l2(query);
+    fn get_last_tx_data(
+        &self,
+        req: &FraudScoreRequest,
+        requested_at: DateTime<Utc>,
+    ) -> Result<(f32, f32), FraudEngineError> {
+        let Some(last_transaction) = &req.last_transaction else {
+            return Ok((-1.0, -1.0));
+        };
 
-            match search_index
-                .index
-                .search(&normalized_query, neighbors, search_index.ef_search)
-            {
-                Ok(results) => {
-                    let fraud_votes = results
-                        .iter()
-                        .filter(|(doc_id, _)| {
-                            self.references
-                                .get(*doc_id as usize)
-                                .is_some_and(|reference| reference.is_fraud)
-                        })
-                        .count();
+        let last_timestamp = parse_utc_timestamp(&last_transaction.timestamp)?;
 
-                    return (results.len(), fraud_votes);
-                }
-                Err(error) => {
-                    warn!(?error, "hnsw search failed; falling back to exact search");
-                }
-            }
-        }
+        let elapsed_seconds = requested_at
+            .signed_duration_since(last_timestamp)
+            .num_seconds()
+            .max(0) as f32;
 
-        self.classify_nearest_neighbors_exact(query, neighbors)
+        let time = clamp_ratio(elapsed_seconds / 60.0, self.normalization.max_minutes);
+
+        let distance = clamp_ratio(
+            last_transaction.km_from_current as f32,
+            self.normalization.max_km,
+        );
+
+        Ok((time, distance))
     }
 
-    fn classify_nearest_neighbors_exact(
-        &self,
-        query: &[f32; 14],
-        neighbors: usize,
-    ) -> (usize, usize) {
+    fn classify_knn(&self, query: &[f32; 14], neighbors: usize) -> (usize, usize) {
+        let start = Instant::now();
+
+        let result = match &self.search_index {
+            SearchIndex::Exact => self.classify_exact(query, neighbors),
+            SearchIndex::Hnsw(index) => self.classify_hnsw(query, neighbors, index),
+        };
+
+        histogram!(
+            "score_engine",
+            "step" => "classify"
+        )
+        .record(start.elapsed().as_micros() as f64);
+
+        result
+    }
+
+    fn classify_exact(&self, query: &[f32; 14], neighbors: usize) -> (usize, usize) {
         let mut best_distances = [f32::INFINITY; K_NEIGHBORS];
         let mut best_is_fraud = [false; K_NEIGHBORS];
         let mut found = 0;
@@ -291,6 +296,7 @@ impl FraudEngine {
             }
 
             let upper_bound = found.min(neighbors.saturating_sub(1));
+
             for index in (insert_at..upper_bound).rev() {
                 best_distances[index + 1] = best_distances[index];
                 best_is_fraud[index + 1] = best_is_fraud[index];
@@ -310,6 +316,31 @@ impl FraudEngine {
 
         (found, fraud_votes)
     }
+
+    fn classify_hnsw(
+        &self,
+        query: &[f32; 14],
+        neighbors: usize,
+        index: &HnswSearchIndex,
+    ) -> (usize, usize) {
+        let normalized_query = normalize_l2(query);
+
+        let results = index
+            .index
+            .search(&normalized_query, neighbors, index.ef_search)
+            .expect("hnsw failed");
+
+        let fraud_votes = results
+            .iter()
+            .filter(|(doc_id, _)| {
+                self.references
+                    .get(*doc_id as usize)
+                    .is_some_and(|reference| reference.is_fraud)
+            })
+            .count();
+
+        (results.len(), fraud_votes)
+    }
 }
 
 fn build_search_index(
@@ -321,7 +352,7 @@ fn build_search_index(
         SearchBackendKind::Hnsw => match build_hnsw_index(references) {
             Ok(index) => SearchIndex::Hnsw(index),
             Err(error) => {
-                warn!(
+                tracing::error!(
                     ?error,
                     "failed to build HNSW index; falling back to exact search"
                 );
@@ -370,6 +401,7 @@ fn build_hnsw_index(references: &[StoredReference]) -> Result<HnswSearchIndex, F
 
 fn load_references(resources_dir: &Path) -> Result<Vec<StoredReference>, FraudEngineError> {
     let compressed_path = resources_dir.join("references.json.gz");
+
     if compressed_path.exists() {
         let file = File::open(&compressed_path).map_err(|error| {
             FraudEngineError::Load(format!(
@@ -377,6 +409,7 @@ fn load_references(resources_dir: &Path) -> Result<Vec<StoredReference>, FraudEn
                 compressed_path.display()
             ))
         })?;
+
         let reader = BufReader::new(GzDecoder::new(file));
 
         let raw_references: Vec<RawReferenceEntry> =
@@ -411,13 +444,11 @@ impl From<RawReferenceEntry> for StoredReference {
     }
 }
 
-fn load_json_file<T>(path: PathBuf) -> Result<T, FraudEngineError>
-where
-    T: serde::de::DeserializeOwned,
-{
+fn load_json_file<T: serde::de::DeserializeOwned>(path: PathBuf) -> Result<T, FraudEngineError> {
     let file = File::open(&path).map_err(|error| {
         FraudEngineError::Load(format!("failed to open {}: {error}", path.display()))
     })?;
+
     let reader = BufReader::new(file);
 
     serde_json::from_reader(reader).map_err(|error| {
@@ -458,11 +489,7 @@ fn clamp_unit(value: f32) -> f32 {
 
 #[inline]
 fn bool_to_unit(value: bool) -> f32 {
-    if value {
-        1.0
-    } else {
-        0.0
-    }
+    if value { 1.0 } else { 0.0 }
 }
 
 #[inline]
