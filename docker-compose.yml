@@ -17,7 +17,7 @@ x-api-template: &api-template
   deploy:
     resources:
       limits:
-        cpus: "0.3"
+        cpus: "0.35"
         memory: 150MB
 
 services:
@@ -62,7 +62,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.4"
+          cpus: "0.3"
           memory: 50MB
 
 volumes:
