@@ -318,7 +318,7 @@ impl FraudEngine {
         let mut found = 0;
 
         for reference in &self.references {
-            let distance = squared_euclidean_distance(query, &reference.vector);
+            let distance = innr::l2_distance_squared(query, &reference.vector);
             let insert_at = best_distances.partition_point(|current| *current < distance);
 
             if insert_at >= neighbors {
@@ -541,17 +541,6 @@ fn bool_to_unit(value: bool) -> f32 {
 }
 
 #[inline]
-fn squared_euclidean_distance(left: &[f32; 14], right: &[f32; 14]) -> f32 {
-    let mut accumulator = 0.0;
-
-    for index in 0..14 {
-        let delta = left[index] - right[index];
-        accumulator += delta * delta;
-    }
-
-    accumulator
-}
-
 fn normalize_l2(vector: &[f32; 14]) -> [f32; 14] {
     let mut squared_norm = 0.0;
 
