@@ -17,7 +17,7 @@ x-api-template: &api-template
   deploy:
     resources:
       limits:
-        cpus: "0.48"
+        cpus: "0.40"
         memory: 150MB
 
 services:
@@ -60,9 +60,9 @@ services:
       start_period: 5s
     restart: unless-stopped
     deploy:
-      resources:
-        limits:
-          cpus: "0.04"
+    resources:
+      limits:
+          cpus: "0.20"
           memory: 50MB
 
 volumes:
