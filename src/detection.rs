@@ -17,6 +17,35 @@ use crate::model::*;
 const K_NEIGHBORS: usize = 5;
 const FRAUD_APPROVAL_THRESHOLD: f32 = 0.6;
 
+#[derive(Debug, Clone, Copy)]
+pub struct HnswConfig {
+    pub ef_construction: usize,
+    pub ef_search: usize,
+}
+
+impl Default for HnswConfig {
+    fn default() -> Self {
+        Self {
+            ef_construction: 200,
+            ef_search: 64,
+        }
+    }
+}
+
+impl HnswConfig {
+    pub fn from_env() -> Self {
+        let default = Self::default();
+
+        Self {
+            ef_construction: crate::read_positive_number_env(
+                "RINHA_HNSW_EF_CONSTRUCTION",
+                default.ef_construction,
+            ),
+            ef_search: crate::read_positive_number_env("RINHA_HNSW_EF_SEARCH", default.ef_search),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FraudEngineError {
     #[error("invalid request: {0}")]
@@ -105,6 +134,7 @@ impl FraudEngine {
     pub fn load(
         resources_dir: &Path,
         configured_search_backend: SearchBackendKind,
+        hnsw_config: HnswConfig,
     ) -> Result<Self, FraudEngineError> {
         let normalization = load_json_file(resources_dir.join("normalization.json"))?;
         let mcc_risk = load_json_file(resources_dir.join("mcc_risk.json"))?;
@@ -117,7 +147,7 @@ impl FraudEngine {
             )));
         }
 
-        let search_index = build_search_index(&references, configured_search_backend);
+        let search_index = build_search_index(&references, configured_search_backend, hnsw_config);
 
         Ok(Self {
             normalization,
@@ -346,10 +376,11 @@ impl FraudEngine {
 fn build_search_index(
     references: &[StoredReference],
     configured_search_backend: SearchBackendKind,
+    hnsw_config: HnswConfig,
 ) -> SearchIndex {
     match configured_search_backend {
         SearchBackendKind::Exact => SearchIndex::Exact,
-        SearchBackendKind::Hnsw => match build_hnsw_index(references) {
+        SearchBackendKind::Hnsw => match build_hnsw_index(references, hnsw_config) {
             Ok(index) => SearchIndex::Hnsw(index),
             Err(error) => {
                 tracing::error!(
@@ -362,18 +393,27 @@ fn build_search_index(
     }
 }
 
-fn build_hnsw_index(references: &[StoredReference]) -> Result<HnswSearchIndex, FraudEngineError> {
+fn build_hnsw_index(
+    references: &[StoredReference],
+    hnsw_config: HnswConfig,
+) -> Result<HnswSearchIndex, FraudEngineError> {
     const VECTOR_DIMENSIONS: usize = 14;
     const HNSW_M: usize = 16;
     const HNSW_M_MAX: usize = 32;
-    const HNSW_EF_CONSTRUCTION: usize = 200;
-    const HNSW_EF_SEARCH: usize = 64;
+    let build_started_at = Instant::now();
+
+    tracing::info!(
+        reference_count = references.len(),
+        ef_construction = hnsw_config.ef_construction,
+        ef_search = hnsw_config.ef_search,
+        "building HNSW index"
+    );
 
     let mut index = HNSWIndex::builder(VECTOR_DIMENSIONS)
         .m(HNSW_M)
         .m_max(HNSW_M_MAX)
-        .ef_construction(HNSW_EF_CONSTRUCTION)
-        .ef_search(HNSW_EF_SEARCH)
+        .ef_construction(hnsw_config.ef_construction)
+        .ef_search(hnsw_config.ef_search)
         .build()
         .map_err(|error| {
             FraudEngineError::Load(format!("failed to initialize HNSW index: {error}"))
@@ -393,9 +433,17 @@ fn build_hnsw_index(references: &[StoredReference]) -> Result<HnswSearchIndex, F
         .build()
         .map_err(|error| FraudEngineError::Load(format!("failed to build HNSW graph: {error}")))?;
 
+    tracing::info!(
+        reference_count = references.len(),
+        ef_construction = hnsw_config.ef_construction,
+        ef_search = hnsw_config.ef_search,
+        build_ms = build_started_at.elapsed().as_secs_f64() * 1_000.0,
+        "built HNSW index"
+    );
+
     Ok(HnswSearchIndex {
         index,
-        ef_search: HNSW_EF_SEARCH,
+        ef_search: hnsw_config.ef_search,
     })
 }
 
@@ -531,8 +579,12 @@ mod tests {
     use crate::model::{Customer, LastTransaction, Merchant, Terminal, Transaction};
 
     fn engine() -> FraudEngine {
-        FraudEngine::load(Path::new("./spec/resources"), SearchBackendKind::Exact)
-            .expect("spec resources should load")
+        FraudEngine::load(
+            Path::new("./spec/resources"),
+            SearchBackendKind::Exact,
+            HnswConfig::default(),
+        )
+        .expect("spec resources should load")
     }
 
     #[test]

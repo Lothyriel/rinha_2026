@@ -28,9 +28,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|value| detection::SearchBackendKind::from_env(&value))
         .unwrap_or(detection::SearchBackendKind::Exact);
 
+    let hnsw_config = detection::HnswConfig::from_env();
+
     let engine = Arc::new(detection::FraudEngine::load(
         resources_dir.as_ref(),
         configured_search_backend,
+        hnsw_config,
     )?);
 
     telemetry::install_from_env().map_err(std::io::Error::other)?;

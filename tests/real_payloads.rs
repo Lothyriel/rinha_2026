@@ -6,15 +6,19 @@ use axum::{
 };
 use rinha_2026::{
     app::{AppState, router},
-    detection::{FraudEngine, SearchBackendKind},
+    detection::{FraudEngine, HnswConfig, SearchBackendKind},
     model::{FraudScoreRequest, FraudScoreResponse},
 };
 use tower::ServiceExt;
 
 fn load_engine() -> Arc<FraudEngine> {
     Arc::new(
-        FraudEngine::load(Path::new("spec/resources"), SearchBackendKind::Exact)
-            .expect("engine should load spec resources"),
+        FraudEngine::load(
+            Path::new("spec/resources"),
+            SearchBackendKind::Exact,
+            HnswConfig::default(),
+        )
+        .expect("engine should load spec resources"),
     )
 }
 
