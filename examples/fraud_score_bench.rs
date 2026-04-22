@@ -18,8 +18,8 @@ fn load_payloads() -> Vec<FraudScoreRequest> {
 fn main() {
     let payloads = load_payloads();
     let iterations = 5_000usize;
-    let build_efforts = [200, 1000];
-    let search_efforts = [2, 16, 64];
+    let build_efforts = [50, 100, 200];
+    let search_efforts = [2, 8, 32];
     let exact_outputs = collect_outputs(
         &load_engine(SearchBackendKind::Exact, HnswConfig::default()),
         &payloads,
