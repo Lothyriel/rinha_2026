@@ -12,5 +12,5 @@
     "nginx",
     "unix sockets"
   ],
-  "open_to_work": true
+  "open_to_work": false
 }
