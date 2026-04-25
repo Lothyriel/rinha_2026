@@ -11,10 +11,16 @@ use rinha_2026::{
 };
 use tower::ServiceExt;
 
-fn load_engine() -> Arc<FraudEngine> {
-    Arc::new(
-        FraudEngine::load(Path::new("spec/resources")).expect("engine should load spec resources"),
-    )
+fn load_engine(example: bool) -> Arc<FraudEngine> {
+    let path = Path::new("spec/resources");
+
+    let engine = if example {
+        FraudEngine::load_example(path)
+    } else {
+        FraudEngine::load(path)
+    };
+
+    Arc::new(engine.expect("engine should load spec resources"))
 }
 
 fn load_payloads() -> Vec<FraudScoreRequest> {
@@ -25,7 +31,7 @@ fn load_payloads() -> Vec<FraudScoreRequest> {
 #[tokio::test]
 async fn official_payload_samples_return_valid_scores() {
     let app = router(AppState {
-        engine: load_engine(),
+        engine: load_engine(false),
     });
 
     for payload in load_payloads() {
@@ -64,7 +70,7 @@ async fn official_payload_samples_return_valid_scores() {
 #[tokio::test]
 async fn invalid_timestamp_returns_bad_request() {
     let app = router(AppState {
-        engine: load_engine(),
+        engine: load_engine(true),
     });
     let mut payload = load_payloads().remove(0);
     payload.transaction.requested_at = "not-a-timestamp".to_owned();

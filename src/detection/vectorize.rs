@@ -114,7 +114,8 @@ mod tests {
     use super::*;
 
     fn engine() -> FraudEngine {
-        FraudEngine::load(Path::new("./spec/resources")).expect("spec resources should load")
+        FraudEngine::load_example(Path::new("./spec/resources"))
+            .expect("spec resources should load")
     }
 
     #[test]

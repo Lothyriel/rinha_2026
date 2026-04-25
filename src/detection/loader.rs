@@ -9,33 +9,33 @@ use flate2::read::GzDecoder;
 
 use super::*;
 
-pub fn load_references(resources_dir: &Path) -> Result<Vec<StoredReference>, FraudEngineError> {
+pub fn load_refs(resources_dir: &Path) -> Result<Vec<StoredReference>, FraudEngineError> {
     let compressed_path = resources_dir.join("references.json.gz");
 
-    if compressed_path.exists() {
-        let file = File::open(&compressed_path).map_err(|error| {
+    let file = File::open(&compressed_path).map_err(|error| {
+        FraudEngineError::Load(format!(
+            "failed to open {}: {error}",
+            compressed_path.display()
+        ))
+    })?;
+
+    let reader = BufReader::new(GzDecoder::new(file));
+
+    let raw_references: Vec<RawReferenceEntry> =
+        serde_json::from_reader(reader).map_err(|error| {
             FraudEngineError::Load(format!(
-                "failed to open {}: {error}",
+                "failed to parse {}: {error}",
                 compressed_path.display()
             ))
         })?;
 
-        let reader = BufReader::new(GzDecoder::new(file));
+    Ok(raw_references
+        .into_iter()
+        .map(StoredReference::from)
+        .collect())
+}
 
-        let raw_references: Vec<RawReferenceEntry> =
-            serde_json::from_reader(reader).map_err(|error| {
-                FraudEngineError::Load(format!(
-                    "failed to parse {}: {error}",
-                    compressed_path.display()
-                ))
-            })?;
-
-        return Ok(raw_references
-            .into_iter()
-            .map(StoredReference::from)
-            .collect());
-    }
-
+pub fn load_example_refs(resources_dir: &Path) -> Result<Vec<StoredReference>, FraudEngineError> {
     let example_path = resources_dir.join("example-references.json");
     let raw_references: Vec<RawReferenceEntry> = load_json_file(example_path)?;
 
@@ -83,7 +83,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loads_official_reference_dataset_when_present() {
+    fn loads_official_reference() {
         let engine =
             FraudEngine::load(Path::new("./spec/resources")).expect("spec resources should load");
 

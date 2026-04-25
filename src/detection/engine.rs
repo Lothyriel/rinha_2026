@@ -8,8 +8,24 @@ impl FraudEngine {
     pub fn load(resources_dir: &Path) -> Result<Self, FraudEngineError> {
         let normalization = loader::load_json_file(resources_dir.join("normalization.json"))?;
         let mcc_risk = loader::load_json_file(resources_dir.join("mcc_risk.json"))?;
-        let references = loader::load_references(resources_dir)?;
+        let references = loader::load_refs(resources_dir)?;
 
+        Self::try_new(references, normalization, mcc_risk)
+    }
+
+    pub fn load_example(resources_dir: &Path) -> Result<Self, FraudEngineError> {
+        let normalization = loader::load_json_file(resources_dir.join("normalization.json"))?;
+        let mcc_risk = loader::load_json_file(resources_dir.join("mcc_risk.json"))?;
+        let references = loader::load_example_refs(resources_dir)?;
+
+        Self::try_new(references, normalization, mcc_risk)
+    }
+
+    fn try_new(
+        references: Vec<StoredReference>,
+        normalization: NormalizationConfig,
+        mcc_risk: HashMap<String, f32>,
+    ) -> Result<Self, FraudEngineError> {
         if references.len() < K_NEIGHBORS {
             return Err(FraudEngineError::Load(format!(
                 "reference dataset must contain at least {K_NEIGHBORS} vectors, found {}",
