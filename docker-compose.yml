@@ -1,5 +1,5 @@
 x-api-template: &api-template
-  image: ghcr.io/lothyriel/rinha_2026:v0.3.0
+  image: ghcr.io/lothyriel/rinha_2026:v0.3.1
   platform: linux/amd64
   volumes:
     - sockets:/sockets
@@ -25,19 +25,13 @@ services:
     <<: *api-template
     environment:
       RINHA_RESOURCES_DIR: /app/resources
-      RINHA_SEARCH_BACKEND: exact
       RINHA_UNIX_SOCKET_PATH: /sockets/api-1.sock
-      RINHA_HNSW_EF_SEARCH: 2
-      RINHA_HNSW_EF_CONSTRUCTION: 100
 
   api-2:
     <<: *api-template
     environment:
       RINHA_RESOURCES_DIR: /app/resources
-      RINHA_SEARCH_BACKEND: exact
       RINHA_UNIX_SOCKET_PATH: /sockets/api-2.sock
-      RINHA_HNSW_EF_SEARCH: 2
-      RINHA_HNSW_EF_CONSTRUCTION: 100
 
   load-balancer:
     image: nginx:1.30-alpine
