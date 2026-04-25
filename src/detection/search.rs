@@ -1,7 +1,3 @@
-use std::time::Instant;
-
-use metrics::histogram;
-
 use super::*;
 
 impl FraudEngine {
@@ -10,128 +6,16 @@ impl FraudEngine {
         query: &[f32; VECTOR_DIMENSIONS],
         neighbors: usize,
     ) -> (usize, usize) {
-        let start = Instant::now();
-
-        let result = match &self.search_index {
-            SearchIndex::Exact(index) => self.classify_exact(query, neighbors, index),
-            SearchIndex::Hnsw(index) => self.classify_hnsw(query, neighbors, index),
-        };
-
-        histogram!("score_engine", "step" => "classify").record(start.elapsed().as_micros() as f64);
-
-        result
+        self.classify_exact(query, neighbors)
     }
 
-    fn classify_exact(
-        &self,
-        query: &[f32; VECTOR_DIMENSIONS],
-        neighbors: usize,
-        index: &ExactSearchIndex,
-    ) -> (usize, usize) {
-        let result = search_exact_knn(&self.references, index, query, neighbors);
+    fn classify_exact(&self, query: &[f32; VECTOR_DIMENSIONS], neighbors: usize) -> (usize, usize) {
+        let result = search_exact_knn(&self.references, &self.index, query, neighbors);
         (result.found, result.fraud_votes(&self.references))
     }
-
-    fn classify_hnsw(
-        &self,
-        query: &[f32; VECTOR_DIMENSIONS],
-        neighbors: usize,
-        index: &HnswSearchIndex,
-    ) -> (usize, usize) {
-        let normalized_query = math::normalize_l2(query);
-
-        let results = index
-            .index
-            .search(&normalized_query, neighbors, index.ef_search)
-            .expect("hnsw failed");
-
-        let fraud_votes = results
-            .iter()
-            .filter(|(doc_id, _)| {
-                self.references
-                    .get(*doc_id as usize)
-                    .is_some_and(|reference| reference.is_fraud)
-            })
-            .count();
-
-        (results.len(), fraud_votes)
-    }
 }
 
-pub fn build_search_index(
-    references: &[StoredReference],
-    configured_search_backend: SearchBackendKind,
-    hnsw_config: HnswConfig,
-) -> SearchIndex {
-    match configured_search_backend {
-        SearchBackendKind::Exact => SearchIndex::Exact(build_exact_index(references)),
-        SearchBackendKind::Hnsw => match build_hnsw_index(references, hnsw_config) {
-            Ok(index) => SearchIndex::Hnsw(index),
-            Err(error) => {
-                tracing::error!(
-                    ?error,
-                    "failed to build HNSW index; falling back to exact search"
-                );
-                SearchIndex::Exact(build_exact_index(references))
-            }
-        },
-    }
-}
-
-fn build_hnsw_index(
-    references: &[StoredReference],
-    hnsw_config: HnswConfig,
-) -> Result<HnswSearchIndex, FraudEngineError> {
-    const HNSW_M: usize = 16;
-    const HNSW_M_MAX: usize = 32;
-    let build_started_at = Instant::now();
-
-    tracing::info!(
-        reference_count = references.len(),
-        ef_construction = hnsw_config.ef_construction,
-        ef_search = hnsw_config.ef_search,
-        "building HNSW index"
-    );
-
-    let mut index = HNSWIndex::builder(VECTOR_DIMENSIONS)
-        .m(HNSW_M)
-        .m_max(HNSW_M_MAX)
-        .ef_construction(hnsw_config.ef_construction)
-        .ef_search(hnsw_config.ef_search)
-        .build()
-        .map_err(|error| {
-            FraudEngineError::Load(format!("failed to initialize HNSW index: {error}"))
-        })?;
-
-    for (doc_id, reference) in references.iter().enumerate() {
-        let normalized_vector = math::normalize_l2(&reference.vector);
-
-        index
-            .add_slice(doc_id as u32, &normalized_vector)
-            .map_err(|error| {
-                FraudEngineError::Load(format!("failed to insert HNSW vector {doc_id}: {error}"))
-            })?;
-    }
-
-    index
-        .build()
-        .map_err(|error| FraudEngineError::Load(format!("failed to build HNSW graph: {error}")))?;
-
-    tracing::info!(
-        reference_count = references.len(),
-        ef_construction = hnsw_config.ef_construction,
-        ef_search = hnsw_config.ef_search,
-        build_ms = build_started_at.elapsed().as_secs_f64() * 1_000.0,
-        "built HNSW index"
-    );
-
-    Ok(HnswSearchIndex {
-        index,
-        ef_search: hnsw_config.ef_search,
-    })
-}
-
-fn build_exact_index(references: &[StoredReference]) -> ExactSearchIndex {
+pub fn build_index(references: &[StoredReference]) -> ExactSearchIndex {
     let mut nodes = Vec::new();
     let mut indices = Vec::with_capacity(references.len());
     let mut point_indices = (0..references.len() as u32).collect::<Vec<_>>();
@@ -387,9 +271,12 @@ mod tests {
 
     fn test_reference(vector: [f32; VECTOR_DIMENSIONS], is_fraud: bool) -> StoredReference {
         StoredReference {
-            vector,
             padded_vector: Vec16::from_vector(vector),
-            is_fraud,
+            label: if is_fraud {
+                ReferenceLabel::Fraud
+            } else {
+                ReferenceLabel::Legit
+            },
         }
     }
 
@@ -413,8 +300,7 @@ mod tests {
     }
 
     fn synthetic_engine(references: Vec<StoredReference>) -> FraudEngine {
-        let search_index =
-            build_search_index(&references, SearchBackendKind::Exact, HnswConfig::default());
+        let index = build_index(&references);
 
         FraudEngine {
             normalization: NormalizationConfig {
@@ -428,7 +314,7 @@ mod tests {
             },
             mcc_risk: HashMap::new(),
             references,
-            search_index,
+            index,
         }
     }
 
@@ -466,26 +352,6 @@ mod tests {
         query
     }
 
-    fn exact_index(engine: &FraudEngine) -> &ExactSearchIndex {
-        match &engine.search_index {
-            SearchIndex::Exact(index) => index,
-            SearchIndex::Hnsw(_) => panic!("expected exact index"),
-        }
-    }
-
-    #[test]
-    fn parses_search_backend_names() {
-        assert_eq!(
-            SearchBackendKind::from_env("exact"),
-            Some(SearchBackendKind::Exact)
-        );
-        assert_eq!(
-            SearchBackendKind::from_env("HNSW"),
-            Some(SearchBackendKind::Hnsw)
-        );
-        assert_eq!(SearchBackendKind::from_env("invalid"), None);
-    }
-
     #[test]
     fn vp_tree_exact_search_matches_bruteforce_knn() {
         let references = (0..96u32)
@@ -513,12 +379,7 @@ mod tests {
         ];
 
         for query in queries {
-            let exact = search_exact_knn(
-                &engine.references,
-                exact_index(&engine),
-                &query,
-                K_NEIGHBORS,
-            );
+            let exact = search_exact_knn(&engine.references, &engine.index, &query, K_NEIGHBORS);
             let brute_force = brute_force_knn(&engine.references, &query, K_NEIGHBORS);
 
             assert_eq!(exact.found, brute_force.found);
@@ -542,7 +403,7 @@ mod tests {
         let engine = synthetic_engine(references);
         let query = [0.25; VECTOR_DIMENSIONS];
 
-        let index = exact_index(&engine);
+        let index = &engine.index;
         let exact = search_exact_knn(&engine.references, index, &query, K_NEIGHBORS);
 
         assert_eq!(exact.found, K_NEIGHBORS);
@@ -562,12 +423,7 @@ mod tests {
 
         for _ in 0..256 {
             let query = random_query(&mut query_state);
-            let exact = search_exact_knn(
-                &engine.references,
-                exact_index(&engine),
-                &query,
-                K_NEIGHBORS,
-            );
+            let exact = search_exact_knn(&engine.references, &engine.index, &query, K_NEIGHBORS);
             let brute_force = brute_force_knn(&engine.references, &query, K_NEIGHBORS);
 
             assert_eq!(exact.found, brute_force.found);

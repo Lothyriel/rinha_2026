@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
@@ -7,7 +7,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use metrics::{counter, histogram};
 
 use crate::{detection::*, model::*};
 
@@ -31,18 +30,11 @@ async fn fraud_score(
     State(state): State<AppState>,
     Json(payload): Json<FraudScoreRequest>,
 ) -> Result<Json<FraudScoreResponse>, AppError> {
-    let start = Instant::now();
-
-    let result = state
+    state
         .engine
         .score(&payload)
         .map(Json)
-        .map_err(AppError::from);
-
-    counter!("http_reqs",).increment(1);
-    histogram!("http_handler_time",).record(start.elapsed().as_micros() as f64);
-
-    result
+        .map_err(AppError::from)
 }
 
 pub enum AppError {

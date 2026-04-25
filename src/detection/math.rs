@@ -93,7 +93,7 @@ impl ExactKnnResult {
                 idx != VP_NONE
                     && references
                         .get(idx as usize)
-                        .is_some_and(|reference| reference.is_fraud)
+                        .is_some_and(|reference| reference.label == ReferenceLabel::Fraud)
             })
             .count()
     }
@@ -130,7 +130,7 @@ pub fn l2_squared_avx(left: &Vec16, right: &Vec16) -> f32 {
 }
 
 #[inline]
-#[target_feature(enable = "avx,sse,sse3")]
+#[target_feature(enable = "avx")]
 unsafe fn horizontal_sum_m256(
     #[cfg(target_arch = "x86_64")] value: std::arch::x86_64::__m256,
 ) -> f32 {
@@ -145,26 +145,4 @@ unsafe fn horizontal_sum_m256(
     let sum = _mm_hadd_ps(combined, combined);
     let sum = _mm_hadd_ps(sum, sum);
     _mm_cvtss_f32(sum)
-}
-
-#[inline]
-pub fn normalize_l2(vector: &[f32; VECTOR_DIMENSIONS]) -> [f32; VECTOR_DIMENSIONS] {
-    let mut squared_norm = 0.0;
-
-    for value in vector {
-        squared_norm += value * value;
-    }
-
-    if squared_norm <= f32::EPSILON {
-        return *vector;
-    }
-
-    let norm = squared_norm.sqrt();
-    let mut normalized = [0.0; VECTOR_DIMENSIONS];
-
-    for index in 0..VECTOR_DIMENSIONS {
-        normalized[index] = vector[index] / norm;
-    }
-
-    normalized
 }

@@ -114,12 +114,7 @@ mod tests {
     use super::*;
 
     fn engine() -> FraudEngine {
-        FraudEngine::load(
-            Path::new("./spec/resources"),
-            SearchBackendKind::Exact,
-            HnswConfig::default(),
-        )
-        .expect("spec resources should load")
+        FraudEngine::load(Path::new("./spec/resources")).expect("spec resources should load")
     }
 
     #[test]

@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use serde::Deserialize;
-use vicinity::hnsw::HNSWIndex;
 
 mod engine;
 mod loader;
@@ -52,35 +51,6 @@ struct PointDistance {
     dist: f32,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct HnswConfig {
-    pub ef_construction: usize,
-    pub ef_search: usize,
-}
-
-impl Default for HnswConfig {
-    fn default() -> Self {
-        Self {
-            ef_construction: 200,
-            ef_search: 64,
-        }
-    }
-}
-
-impl HnswConfig {
-    pub fn from_env() -> Self {
-        let default = Self::default();
-
-        Self {
-            ef_construction: crate::read_positive_number_env(
-                "RINHA_HNSW_EF_CONSTRUCTION",
-                default.ef_construction,
-            ),
-            ef_search: crate::read_positive_number_env("RINHA_HNSW_EF_SEARCH", default.ef_search),
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum FraudEngineError {
     #[error("invalid request: {0}")]
@@ -117,45 +87,8 @@ enum ReferenceLabel {
 
 #[derive(Debug)]
 struct StoredReference {
-    vector: [f32; VECTOR_DIMENSIONS],
     padded_vector: Vec16,
-    is_fraud: bool,
-}
-
-#[derive(Debug)]
-struct HnswSearchIndex {
-    index: HNSWIndex,
-    ef_search: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchBackendKind {
-    Exact,
-    Hnsw,
-}
-
-impl SearchBackendKind {
-    pub fn from_env(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "exact" => Some(Self::Exact),
-            "hnsw" => Some(Self::Hnsw),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Exact => "exact",
-            Self::Hnsw => "hnsw",
-        }
-    }
-}
-
-#[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
-enum SearchIndex {
-    Exact(ExactSearchIndex),
-    Hnsw(HnswSearchIndex),
+    label: ReferenceLabel,
 }
 
 #[derive(Debug)]
@@ -163,5 +96,5 @@ pub struct FraudEngine {
     normalization: NormalizationConfig,
     mcc_risk: HashMap<String, f32>,
     references: Vec<StoredReference>,
-    search_index: SearchIndex,
+    index: ExactSearchIndex,
 }

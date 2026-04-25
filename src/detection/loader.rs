@@ -70,9 +70,8 @@ pub fn parse_utc_timestamp(value: &str) -> Result<DateTime<Utc>, FraudEngineErro
 impl From<RawReferenceEntry> for StoredReference {
     fn from(value: RawReferenceEntry) -> Self {
         Self {
-            vector: value.vector,
             padded_vector: Vec16::from_vector(value.vector),
-            is_fraud: value.label == ReferenceLabel::Fraud,
+            label: value.label,
         }
     }
 }
@@ -85,12 +84,8 @@ mod tests {
 
     #[test]
     fn loads_official_reference_dataset_when_present() {
-        let engine = FraudEngine::load(
-            Path::new("./spec/resources"),
-            SearchBackendKind::Exact,
-            HnswConfig::default(),
-        )
-        .expect("spec resources should load");
+        let engine =
+            FraudEngine::load(Path::new("./spec/resources")).expect("spec resources should load");
 
         assert!(engine.reference_count() >= 100_000);
     }

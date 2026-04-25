@@ -1,9 +1,7 @@
 use std::{fs, net::SocketAddr, path::Path, sync::Arc};
 
-use rinha_2026::{app, detection, telemetry};
+use rinha_2026::{app, detection};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-use std::os::unix::fs::PermissionsExt;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -18,31 +16,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resources_dir =
         std::env::var("RINHA_RESOURCES_DIR").unwrap_or_else(|_| "./spec/resources".to_owned());
 
-    let port = std::env::var("PORT")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(9999);
-
-    let configured_search_backend = std::env::var("RINHA_SEARCH_BACKEND")
-        .ok()
-        .and_then(|value| detection::SearchBackendKind::from_env(&value))
-        .unwrap_or(detection::SearchBackendKind::Exact);
-
-    let hnsw_config = detection::HnswConfig::from_env();
-
-    let engine = Arc::new(detection::FraudEngine::load(
-        resources_dir.as_ref(),
-        configured_search_backend,
-        hnsw_config,
-    )?);
-
-    telemetry::install_from_env().map_err(std::io::Error::other)?;
+    let engine = Arc::new(detection::FraudEngine::load(resources_dir.as_ref())?);
 
     let reference_count = engine.reference_count();
-    let active_search_backend = engine.search_backend_name();
     let app = app::router(app::AppState { engine });
 
-    #[cfg(unix)]
     if let Some(socket_path) = std::env::var("RINHA_UNIX_SOCKET_PATH")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -60,14 +38,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let listener = tokio::net::UnixListener::bind(socket_path)?;
-        fs::set_permissions(socket_path, fs::Permissions::from_mode(0o666))?;
 
         tracing::info!(
             socket_path = %socket_path.display(),
             reference_count,
             resources_dir,
-            configured_search_backend = configured_search_backend.as_str(),
-            active_search_backend,
             "fraud API listening on unix socket"
         );
 
@@ -78,15 +53,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let address = SocketAddr::from(([0, 0, 0, 0], port));
+    let address = SocketAddr::from(([0, 0, 0, 0], 9999));
     let listener = tokio::net::TcpListener::bind(address).await?;
 
     tracing::info!(
         %address,
         reference_count,
         resources_dir,
-        configured_search_backend = configured_search_backend.as_str(),
-        active_search_backend,
         "fraud API listening on tcp"
     );
 
@@ -104,7 +77,6 @@ async fn shutdown_signal() {
         }
     };
 
-    #[cfg(unix)]
     let terminate = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             Ok(mut signal) => {
