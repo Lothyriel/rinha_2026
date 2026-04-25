@@ -16,6 +16,45 @@ use crate::model::*;
 
 const K_NEIGHBORS: usize = 5;
 const FRAUD_APPROVAL_THRESHOLD: f32 = 0.6;
+const VECTOR_DIMENSIONS: usize = 14;
+const PADDED_VECTOR_DIMENSIONS: usize = 16;
+const LEAF_SIZE: usize = 32;
+const VP_NONE: u32 = u32::MAX;
+const EXACT_STACK_CAPACITY: usize = 256;
+const PIVOT_SAMPLE_SIZE: usize = 64;
+
+#[repr(align(32))]
+#[derive(Debug, Clone, Copy)]
+struct Vec16([f32; PADDED_VECTOR_DIMENSIONS]);
+
+#[derive(Debug, Clone, Copy)]
+struct VpNode {
+    pivot_idx: u32,
+    radius: f32,
+    left: u32,
+    right: u32,
+    start: u32,
+    len: u32,
+}
+
+#[derive(Debug)]
+struct ExactSearchIndex {
+    nodes: Vec<VpNode>,
+    indices: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExactKnnResult {
+    best_distances: [f32; K_NEIGHBORS],
+    best_indices: [u32; K_NEIGHBORS],
+    found: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PointDistance {
+    idx: u32,
+    dist: f32,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct HnswConfig {
@@ -82,7 +121,8 @@ enum ReferenceLabel {
 
 #[derive(Debug)]
 struct StoredReference {
-    vector: [f32; 14],
+    vector: [f32; VECTOR_DIMENSIONS],
+    padded_vector: Vec16,
     is_fraud: bool,
 }
 
@@ -118,7 +158,7 @@ impl SearchBackendKind {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum SearchIndex {
-    Exact,
+    Exact(ExactSearchIndex),
     Hnsw(HnswSearchIndex),
 }
 
@@ -198,7 +238,7 @@ impl FraudEngine {
 
     pub fn search_backend_name(&self) -> &'static str {
         match &self.search_index {
-            SearchIndex::Exact => "exact",
+            SearchIndex::Exact(_) => "exact",
             SearchIndex::Hnsw(_) => "hnsw",
         }
     }
@@ -299,7 +339,7 @@ impl FraudEngine {
         let start = Instant::now();
 
         let result = match &self.search_index {
-            SearchIndex::Exact => self.classify_exact(query, neighbors),
+            SearchIndex::Exact(index) => self.classify_exact(query, neighbors, index),
             SearchIndex::Hnsw(index) => self.classify_hnsw(query, neighbors, index),
         };
 
@@ -312,39 +352,14 @@ impl FraudEngine {
         result
     }
 
-    fn classify_exact(&self, query: &[f32; 14], neighbors: usize) -> (usize, usize) {
-        let mut best_distances = [f32::INFINITY; K_NEIGHBORS];
-        let mut best_is_fraud = [false; K_NEIGHBORS];
-        let mut found = 0;
-
-        for reference in &self.references {
-            let distance = innr::l2_distance_squared(query, &reference.vector);
-            let insert_at = best_distances.partition_point(|current| *current < distance);
-
-            if insert_at >= neighbors {
-                continue;
-            }
-
-            let upper_bound = found.min(neighbors.saturating_sub(1));
-
-            for index in (insert_at..upper_bound).rev() {
-                best_distances[index + 1] = best_distances[index];
-                best_is_fraud[index + 1] = best_is_fraud[index];
-            }
-
-            best_distances[insert_at] = distance;
-            best_is_fraud[insert_at] = reference.is_fraud;
-            found = (found + 1).min(neighbors);
-        }
-
-        let fraud_votes = best_is_fraud
-            .iter()
-            .zip(best_distances.iter())
-            .take(found)
-            .filter(|(is_fraud, distance)| **is_fraud && distance.is_finite())
-            .count();
-
-        (found, fraud_votes)
+    fn classify_exact(
+        &self,
+        query: &[f32; VECTOR_DIMENSIONS],
+        neighbors: usize,
+        index: &ExactSearchIndex,
+    ) -> (usize, usize) {
+        let result = search_exact_knn(&self.references, index, query, neighbors);
+        (result.found, result.fraud_votes(&self.references))
     }
 
     fn classify_hnsw(
@@ -379,7 +394,7 @@ fn build_search_index(
     hnsw_config: HnswConfig,
 ) -> SearchIndex {
     match configured_search_backend {
-        SearchBackendKind::Exact => SearchIndex::Exact,
+        SearchBackendKind::Exact => SearchIndex::Exact(build_exact_index(references)),
         SearchBackendKind::Hnsw => match build_hnsw_index(references, hnsw_config) {
             Ok(index) => SearchIndex::Hnsw(index),
             Err(error) => {
@@ -387,7 +402,7 @@ fn build_search_index(
                     ?error,
                     "failed to build HNSW index; falling back to exact search"
                 );
-                SearchIndex::Exact
+                SearchIndex::Exact(build_exact_index(references))
             }
         },
     }
@@ -397,7 +412,6 @@ fn build_hnsw_index(
     references: &[StoredReference],
     hnsw_config: HnswConfig,
 ) -> Result<HnswSearchIndex, FraudEngineError> {
-    const VECTOR_DIMENSIONS: usize = 14;
     const HNSW_M: usize = 16;
     const HNSW_M_MAX: usize = 32;
     let build_started_at = Instant::now();
@@ -447,6 +461,250 @@ fn build_hnsw_index(
     })
 }
 
+fn build_exact_index(references: &[StoredReference]) -> ExactSearchIndex {
+    let mut nodes = Vec::new();
+    let mut indices = Vec::with_capacity(references.len());
+    let mut point_indices = (0..references.len() as u32).collect::<Vec<_>>();
+
+    if !point_indices.is_empty() {
+        build_vp_node(references, &mut point_indices, &mut nodes, &mut indices);
+    }
+
+    ExactSearchIndex { nodes, indices }
+}
+
+fn build_vp_node(
+    references: &[StoredReference],
+    point_indices: &mut [u32],
+    nodes: &mut Vec<VpNode>,
+    leaf_indices: &mut Vec<u32>,
+) -> u32 {
+    let node_idx = nodes.len() as u32;
+    nodes.push(VpNode {
+        pivot_idx: VP_NONE,
+        radius: 0.0,
+        left: VP_NONE,
+        right: VP_NONE,
+        start: 0,
+        len: 0,
+    });
+
+    if point_indices.len() <= LEAF_SIZE {
+        finalize_leaf_node(nodes, node_idx, point_indices, leaf_indices);
+        return node_idx;
+    }
+
+    let pivot_position = choose_pivot_position(references, point_indices);
+    point_indices.swap(pivot_position, point_indices.len() - 1);
+
+    let pivot_idx = point_indices[point_indices.len() - 1];
+    let pivot = &references[pivot_idx as usize].padded_vector;
+    let candidates = &mut point_indices[..point_indices.len() - 1];
+
+    if candidates.is_empty() {
+        finalize_leaf_node(nodes, node_idx, point_indices, leaf_indices);
+        return node_idx;
+    }
+
+    let mut distances = candidates
+        .iter()
+        .map(|&idx| PointDistance {
+            idx,
+            dist: l2_squared_scalar(pivot, &references[idx as usize].padded_vector),
+        })
+        .collect::<Vec<_>>();
+
+    let median_position = distances.len() / 2;
+    distances.select_nth_unstable_by(median_position, |left, right| {
+        left.dist.total_cmp(&right.dist)
+    });
+
+    let radius = distances[median_position].dist;
+    let mut left_len = 0usize;
+
+    for point in &distances {
+        if point.dist <= radius {
+            candidates[left_len] = point.idx;
+            left_len += 1;
+        }
+    }
+
+    if left_len == 0 || left_len == distances.len() {
+        finalize_leaf_node(nodes, node_idx, point_indices, leaf_indices);
+        return node_idx;
+    }
+
+    for point in &distances {
+        if point.dist > radius {
+            candidates[left_len] = point.idx;
+            left_len += 1;
+        }
+    }
+
+    let split_at = distances.iter().filter(|point| point.dist <= radius).count();
+    let (left_slice, right_slice) = candidates.split_at_mut(split_at);
+    let left = build_vp_node(references, left_slice, nodes, leaf_indices);
+    let right = build_vp_node(references, right_slice, nodes, leaf_indices);
+
+    nodes[node_idx as usize] = VpNode {
+        pivot_idx,
+        radius,
+        left,
+        right,
+        start: 0,
+        len: 0,
+    };
+
+    node_idx
+}
+
+fn finalize_leaf_node(
+    nodes: &mut [VpNode],
+    node_idx: u32,
+    point_indices: &[u32],
+    leaf_indices: &mut Vec<u32>,
+) {
+    let start = leaf_indices.len() as u32;
+    leaf_indices.extend_from_slice(point_indices);
+    nodes[node_idx as usize] = VpNode {
+        pivot_idx: VP_NONE,
+        radius: 0.0,
+        left: VP_NONE,
+        right: VP_NONE,
+        start,
+        len: point_indices.len() as u32,
+    };
+}
+
+fn choose_pivot_position(references: &[StoredReference], point_indices: &[u32]) -> usize {
+    let sample_len = point_indices.len().min(PIVOT_SAMPLE_SIZE);
+
+    if sample_len <= 1 {
+        return 0;
+    }
+
+    let step = point_indices.len().div_ceil(sample_len);
+    let mut sampled_positions = [0usize; PIVOT_SAMPLE_SIZE];
+
+    for (index, position) in sampled_positions.iter_mut().take(sample_len).enumerate() {
+        *position = (index * step).min(point_indices.len() - 1);
+    }
+
+    let mut best_position = sampled_positions[0];
+    let mut best_mean_distance = f32::NEG_INFINITY;
+
+    for &candidate_position in sampled_positions.iter().take(sample_len) {
+        let candidate = &references[point_indices[candidate_position] as usize].padded_vector;
+        let mut total_distance = 0.0f32;
+
+        for &comparison_position in sampled_positions.iter().take(sample_len) {
+            if comparison_position == candidate_position {
+                continue;
+            }
+
+            total_distance += l2_squared_scalar(
+                candidate,
+                &references[point_indices[comparison_position] as usize].padded_vector,
+            );
+        }
+
+        let mean_distance = total_distance / (sample_len.saturating_sub(1) as f32);
+
+        if mean_distance > best_mean_distance {
+            best_mean_distance = mean_distance;
+            best_position = candidate_position;
+        }
+    }
+
+    best_position
+}
+
+fn search_exact_knn(
+    references: &[StoredReference],
+    index: &ExactSearchIndex,
+    query: &[f32; VECTOR_DIMENSIONS],
+    neighbors: usize,
+) -> ExactKnnResult {
+    let query = Vec16::from_query(query);
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+    {
+        // SAFETY: guarded by runtime feature detection.
+        unsafe {
+            return search_exact_knn_with_distance(references, index, &query, neighbors, l2_squared_avx2);
+        }
+    }
+
+    search_exact_knn_with_distance(references, index, &query, neighbors, l2_squared_scalar)
+}
+
+fn search_exact_knn_with_distance(
+    references: &[StoredReference],
+    index: &ExactSearchIndex,
+    query: &Vec16,
+    neighbors: usize,
+    distance_fn: fn(&Vec16, &Vec16) -> f32,
+) -> ExactKnnResult {
+    let mut result = ExactKnnResult::new();
+
+    if index.nodes.is_empty() || neighbors == 0 {
+        return result;
+    }
+
+    let mut stack = [VP_NONE; EXACT_STACK_CAPACITY];
+    let mut stack_len = 1usize;
+    stack[0] = 0;
+
+    while stack_len > 0 {
+        stack_len -= 1;
+        let node = &index.nodes[stack[stack_len] as usize];
+
+        if node.len > 0 {
+            let leaf_start = node.start as usize;
+            let leaf_end = leaf_start + node.len as usize;
+
+            for &reference_idx in &index.indices[leaf_start..leaf_end] {
+                let distance =
+                    distance_fn(query, &references[reference_idx as usize].padded_vector);
+                result.insert(reference_idx, distance, neighbors);
+            }
+
+            continue;
+        }
+
+        let pivot_idx = node.pivot_idx as usize;
+        let pivot_distance = distance_fn(query, &references[pivot_idx].padded_vector);
+        result.insert(node.pivot_idx, pivot_distance, neighbors);
+
+        let (near, far) = if pivot_distance <= node.radius {
+            (node.left, node.right)
+        } else {
+            (node.right, node.left)
+        };
+
+        if far != VP_NONE && (pivot_distance - node.radius).abs() <= result.worst_distance(neighbors) {
+            push_stack(&mut stack, &mut stack_len, far);
+        }
+
+        if near != VP_NONE {
+            push_stack(&mut stack, &mut stack_len, near);
+        }
+    }
+
+    result
+}
+
+fn push_stack(stack: &mut [u32; EXACT_STACK_CAPACITY], stack_len: &mut usize, value: u32) {
+    assert!(
+        *stack_len < EXACT_STACK_CAPACITY,
+        "vp-tree traversal stack exceeded capacity"
+    );
+    stack[*stack_len] = value;
+    *stack_len += 1;
+}
+
 fn load_references(resources_dir: &Path) -> Result<Vec<StoredReference>, FraudEngineError> {
     let compressed_path = resources_dir.join("references.json.gz");
 
@@ -487,6 +745,7 @@ impl From<RawReferenceEntry> for StoredReference {
     fn from(value: RawReferenceEntry) -> Self {
         Self {
             vector: value.vector,
+            padded_vector: Vec16::from_vector(value.vector),
             is_fraud: value.label == ReferenceLabel::Fraud,
         }
     }
@@ -540,8 +799,132 @@ fn bool_to_unit(value: bool) -> f32 {
     if value { 1.0 } else { 0.0 }
 }
 
+impl Vec16 {
+    fn from_vector(vector: [f32; VECTOR_DIMENSIONS]) -> Self {
+        let mut padded = [0.0; PADDED_VECTOR_DIMENSIONS];
+        padded[..VECTOR_DIMENSIONS].copy_from_slice(&vector);
+        Self(padded)
+    }
+
+    fn from_query(vector: &[f32; VECTOR_DIMENSIONS]) -> Self {
+        let mut padded = [0.0; PADDED_VECTOR_DIMENSIONS];
+        padded[..VECTOR_DIMENSIONS].copy_from_slice(vector);
+        Self(padded)
+    }
+}
+
+impl ExactKnnResult {
+    fn new() -> Self {
+        Self {
+            best_distances: [f32::INFINITY; K_NEIGHBORS],
+            best_indices: [VP_NONE; K_NEIGHBORS],
+            found: 0,
+        }
+    }
+
+    fn insert(&mut self, idx: u32, distance: f32, neighbors: usize) {
+        let insert_at = self
+            .best_distances
+            .partition_point(|current| *current < distance);
+
+        if insert_at >= neighbors {
+            return;
+        }
+
+        let upper_bound = self.found.min(neighbors.saturating_sub(1));
+
+        for index in (insert_at..upper_bound).rev() {
+            self.best_distances[index + 1] = self.best_distances[index];
+            self.best_indices[index + 1] = self.best_indices[index];
+        }
+
+        self.best_distances[insert_at] = distance;
+        self.best_indices[insert_at] = idx;
+        self.found = (self.found + 1).min(neighbors);
+    }
+
+    fn worst_distance(&self, neighbors: usize) -> f32 {
+        if self.found < neighbors {
+            f32::INFINITY
+        } else {
+            self.best_distances[neighbors - 1]
+        }
+    }
+
+    fn fraud_votes(&self, references: &[StoredReference]) -> usize {
+        self.best_indices[..self.found]
+            .iter()
+            .filter(|&&idx| {
+                idx != VP_NONE
+                    && references
+                        .get(idx as usize)
+                        .is_some_and(|reference| reference.is_fraud)
+            })
+            .count()
+    }
+}
+
 #[inline]
-fn normalize_l2(vector: &[f32; 14]) -> [f32; 14] {
+fn l2_squared_scalar(left: &Vec16, right: &Vec16) -> f32 {
+    let mut total = 0.0f32;
+
+    for index in 0..PADDED_VECTOR_DIMENSIONS {
+        let difference = left.0[index] - right.0[index];
+        total += difference * difference;
+    }
+
+    total
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn l2_squared_avx2(left: &Vec16, right: &Vec16) -> f32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps, _mm256_sub_ps,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps, _mm256_sub_ps,
+    };
+
+    let mut accumulated = _mm256_setzero_ps();
+
+    for offset in (0..PADDED_VECTOR_DIMENSIONS).step_by(8) {
+        let lhs = unsafe { _mm256_loadu_ps(left.0.as_ptr().add(offset)) };
+        let rhs = unsafe { _mm256_loadu_ps(right.0.as_ptr().add(offset)) };
+        let difference = _mm256_sub_ps(lhs, rhs);
+        accumulated = _mm256_fmadd_ps(difference, difference, accumulated);
+    }
+
+    horizontal_sum_m256(accumulated)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+unsafe fn horizontal_sum_m256(
+    #[cfg(target_arch = "x86")] value: std::arch::x86::__m256,
+    #[cfg(target_arch = "x86_64")] value: std::arch::x86_64::__m256,
+) -> f32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        _mm256_castps256_ps128, _mm256_extractf128_ps, _mm_add_ps, _mm_cvtss_f32, _mm_hadd_ps,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _mm256_castps256_ps128, _mm256_extractf128_ps, _mm_add_ps, _mm_cvtss_f32, _mm_hadd_ps,
+    };
+
+    let lower = _mm256_castps256_ps128(value);
+    let upper = _mm256_extractf128_ps(value, 1);
+    let combined = _mm_add_ps(lower, upper);
+    let sum = _mm_hadd_ps(combined, combined);
+    let sum = _mm_hadd_ps(sum, sum);
+    _mm_cvtss_f32(sum)
+}
+
+#[inline]
+fn normalize_l2(vector: &[f32; VECTOR_DIMENSIONS]) -> [f32; VECTOR_DIMENSIONS] {
     let mut squared_norm = 0.0;
 
     for value in vector {
@@ -553,9 +936,9 @@ fn normalize_l2(vector: &[f32; 14]) -> [f32; 14] {
     }
 
     let norm = squared_norm.sqrt();
-    let mut normalized = [0.0; 14];
+    let mut normalized = [0.0; VECTOR_DIMENSIONS];
 
-    for index in 0..14 {
+    for index in 0..VECTOR_DIMENSIONS {
         normalized[index] = vector[index] / norm;
     }
 
