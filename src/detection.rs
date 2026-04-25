@@ -499,7 +499,8 @@ fn build_vp_node(
 
     let pivot_idx = point_indices[point_indices.len() - 1];
     let pivot = &references[pivot_idx as usize].padded_vector;
-    let candidates = &mut point_indices[..point_indices.len() - 1];
+    let candidate_len = point_indices.len() - 1;
+    let candidates = &mut point_indices[..candidate_len];
 
     if candidates.is_empty() {
         finalize_leaf_node(nodes, node_idx, point_indices, leaf_indices);
@@ -633,7 +634,9 @@ fn search_exact_knn(
     {
         // SAFETY: guarded by runtime feature detection.
         unsafe {
-            return search_exact_knn_with_distance(references, index, &query, neighbors, l2_squared_avx2);
+            return search_exact_knn_with_distance(references, index, &query, neighbors, |left, right| {
+                l2_squared_avx2(left, right)
+            });
         }
     }
 
@@ -645,7 +648,7 @@ fn search_exact_knn_with_distance(
     index: &ExactSearchIndex,
     query: &Vec16,
     neighbors: usize,
-    distance_fn: fn(&Vec16, &Vec16) -> f32,
+    distance_fn: impl Fn(&Vec16, &Vec16) -> f32,
 ) -> ExactKnnResult {
     let mut result = ExactKnnResult::new();
 
@@ -877,7 +880,7 @@ fn l2_squared_scalar(left: &Vec16, right: &Vec16) -> f32 {
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx,avx2,fma,sse,sse3")]
 unsafe fn l2_squared_avx2(left: &Vec16, right: &Vec16) -> f32 {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::{
@@ -897,11 +900,12 @@ unsafe fn l2_squared_avx2(left: &Vec16, right: &Vec16) -> f32 {
         accumulated = _mm256_fmadd_ps(difference, difference, accumulated);
     }
 
-    horizontal_sum_m256(accumulated)
+    unsafe { horizontal_sum_m256(accumulated) }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[inline]
+#[target_feature(enable = "avx,sse,sse3")]
 unsafe fn horizontal_sum_m256(
     #[cfg(target_arch = "x86")] value: std::arch::x86::__m256,
     #[cfg(target_arch = "x86_64")] value: std::arch::x86_64::__m256,
@@ -949,6 +953,63 @@ fn normalize_l2(vector: &[f32; VECTOR_DIMENSIONS]) -> [f32; VECTOR_DIMENSIONS] {
 mod tests {
     use super::*;
     use crate::model::{Customer, LastTransaction, Merchant, Terminal, Transaction};
+
+    fn test_reference(vector: [f32; VECTOR_DIMENSIONS], is_fraud: bool) -> StoredReference {
+        StoredReference {
+            vector,
+            padded_vector: Vec16::from_vector(vector),
+            is_fraud,
+        }
+    }
+
+    fn brute_force_knn(
+        references: &[StoredReference],
+        query: &[f32; VECTOR_DIMENSIONS],
+        neighbors: usize,
+    ) -> ExactKnnResult {
+        let query = Vec16::from_query(query);
+        let mut result = ExactKnnResult::new();
+
+        for (index, reference) in references.iter().enumerate() {
+            result.insert(
+                index as u32,
+                l2_squared_scalar(&query, &reference.padded_vector),
+                neighbors,
+            );
+        }
+
+        result
+    }
+
+    fn synthetic_engine(references: Vec<StoredReference>) -> FraudEngine {
+        let search_index = build_search_index(
+            &references,
+            SearchBackendKind::Exact,
+            HnswConfig::default(),
+        );
+
+        FraudEngine {
+            normalization: NormalizationConfig {
+                max_amount: 1.0,
+                max_installments: 1.0,
+                amount_vs_avg_ratio: 1.0,
+                max_minutes: 1.0,
+                max_km: 1.0,
+                max_tx_count_24h: 1.0,
+                max_merchant_avg_amount: 1.0,
+            },
+            mcc_risk: HashMap::new(),
+            references,
+            search_index,
+        }
+    }
+
+    fn exact_index(engine: &FraudEngine) -> &ExactSearchIndex {
+        match &engine.search_index {
+            SearchIndex::Exact(index) => index,
+            SearchIndex::Hnsw(_) => panic!("expected exact index"),
+        }
+    }
 
     fn engine() -> FraudEngine {
         FraudEngine::load(
@@ -1063,5 +1124,63 @@ mod tests {
             Some(SearchBackendKind::Hnsw)
         );
         assert_eq!(SearchBackendKind::from_env("invalid"), None);
+    }
+
+    #[test]
+    fn vp_tree_exact_search_matches_bruteforce_knn() {
+        let references = (0..96u32)
+            .map(|value| {
+                let mut vector = [0.0; VECTOR_DIMENSIONS];
+
+                for dimension in 0..VECTOR_DIMENSIONS {
+                    vector[dimension] = ((value * (dimension as u32 + 3)) % 29) as f32 / 31.0
+                        + value as f32 / 100.0
+                        + dimension as f32 / 1_000.0;
+                }
+
+                test_reference(vector, value % 3 == 0)
+            })
+            .collect::<Vec<_>>();
+        let engine = synthetic_engine(references);
+        let queries = [
+            [0.11, 0.07, 0.43, 0.29, 0.31, 0.17, 0.23, 0.19, 0.41, 0.13, 0.37, 0.47, 0.53, 0.59],
+            [0.62, 0.18, 0.24, 0.76, 0.08, 0.44, 0.52, 0.34, 0.68, 0.12, 0.56, 0.26, 0.72, 0.16],
+            [0.91, 0.83, 0.75, 0.67, 0.59, 0.51, 0.43, 0.35, 0.27, 0.19, 0.11, 0.03, 0.95, 0.87],
+        ];
+
+        for query in queries {
+            let exact = search_exact_knn(&engine.references, exact_index(&engine), &query, K_NEIGHBORS);
+            let brute_force = brute_force_knn(&engine.references, &query, K_NEIGHBORS);
+
+            assert_eq!(exact.found, brute_force.found);
+            assert_eq!(exact.best_indices, brute_force.best_indices);
+
+            for (left, right) in exact
+                .best_distances
+                .iter()
+                .zip(brute_force.best_distances.iter())
+            {
+                assert!((left - right).abs() < 0.0001);
+            }
+        }
+    }
+
+    #[test]
+    fn vp_tree_handles_identical_vectors_without_degenerate_recursion() {
+        let references = (0..48u32)
+            .map(|value| test_reference([0.25; VECTOR_DIMENSIONS], value % 2 == 0))
+            .collect::<Vec<_>>();
+        let engine = synthetic_engine(references);
+        let query = [0.25; VECTOR_DIMENSIONS];
+
+        let index = exact_index(&engine);
+        let exact = search_exact_knn(&engine.references, index, &query, K_NEIGHBORS);
+
+        assert_eq!(exact.found, K_NEIGHBORS);
+        assert_eq!(index.nodes.len(), 1);
+        assert_eq!(index.nodes[0].len, 48);
+        assert!(exact.best_distances[..exact.found]
+            .iter()
+            .all(|distance| *distance == 0.0));
     }
 }

@@ -6,7 +6,7 @@ Implementação inicial em Rust para a Rinha de Backend 2026.
 
 - API com `GET /ready` e `POST /fraud-score`
 - Vetorização 14D conforme a spec
-- Busca KNN exata com distância euclidiana
+- Busca KNN exata com VP-tree flattenizada + distância euclidiana quadrática
 - Carregamento do dataset oficial via `resources/references.json.gz`
 - `docker-compose.yml` com nginx + 2 instâncias da API
 
