@@ -15,13 +15,20 @@ impl FraudEngine {
     }
 }
 
-pub fn build_index(references: &[StoredReference]) -> ExactSearchIndex {
+pub fn build_index(references: &[StoredReference], leaf_size: usize) -> ExactSearchIndex {
     let mut nodes = Vec::new();
     let mut indices = Vec::with_capacity(references.len());
     let mut point_indices = (0..references.len() as u32).collect::<Vec<_>>();
 
     if !point_indices.is_empty() {
-        build_vp_node(references, &mut point_indices, &mut nodes, &mut indices, 1);
+        build_vp_node(
+            references,
+            &mut point_indices,
+            &mut nodes,
+            &mut indices,
+            1,
+            leaf_size,
+        );
     }
 
     ExactSearchIndex { nodes, indices }
@@ -33,6 +40,7 @@ fn build_vp_node(
     nodes: &mut Vec<VpNode>,
     leaf_indices: &mut Vec<u32>,
     depth: usize,
+    leaf_size: usize,
 ) -> u32 {
     let node_idx = nodes.len() as u32;
     nodes.push(VpNode {
@@ -44,7 +52,7 @@ fn build_vp_node(
         len: 0,
     });
 
-    if point_indices.len() <= LEAF_SIZE || depth >= EXACT_STACK_CAPACITY {
+    if point_indices.len() <= leaf_size || depth >= EXACT_STACK_CAPACITY {
         finalize_leaf_node(nodes, node_idx, point_indices, leaf_indices);
         return node_idx;
     }
@@ -100,8 +108,8 @@ fn build_vp_node(
     }
 
     let (left_slice, right_slice) = candidates.split_at_mut(left_count);
-    let left = build_vp_node(references, left_slice, nodes, leaf_indices, depth + 1);
-    let right = build_vp_node(references, right_slice, nodes, leaf_indices, depth + 1);
+    let left = build_vp_node(references, left_slice, nodes, leaf_indices, depth + 1, leaf_size);
+    let right = build_vp_node(references, right_slice, nodes, leaf_indices, depth + 1, leaf_size);
 
     nodes[node_idx as usize] = VpNode {
         pivot_idx,
@@ -300,7 +308,7 @@ mod tests {
     }
 
     fn synthetic_engine(references: Vec<StoredReference>) -> FraudEngine {
-        let index = build_index(&references);
+        let index = build_index(&references, LEAF_SIZE);
 
         FraudEngine {
             normalization: NormalizationConfig {

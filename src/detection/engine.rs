@@ -6,26 +6,47 @@ use super::*;
 
 impl FraudEngine {
     pub fn load(resources_dir: &Path) -> Result<Self, FraudEngineError> {
+        Self::load_with_leaf_size(resources_dir, LEAF_SIZE)
+    }
+
+    pub fn load_with_leaf_size(
+        resources_dir: &Path,
+        leaf_size: usize,
+    ) -> Result<Self, FraudEngineError> {
         let normalization = loader::load_json_file(resources_dir.join("normalization.json"))?;
         let mcc_risk = loader::load_json_file(resources_dir.join("mcc_risk.json"))?;
         let references = loader::load_refs(resources_dir)?;
 
-        Self::try_new(references, normalization, mcc_risk)
+        Self::try_new(references, normalization, mcc_risk, leaf_size)
     }
 
     pub fn load_example(resources_dir: &Path) -> Result<Self, FraudEngineError> {
+        Self::load_example_with_leaf_size(resources_dir, LEAF_SIZE)
+    }
+
+    pub fn load_example_with_leaf_size(
+        resources_dir: &Path,
+        leaf_size: usize,
+    ) -> Result<Self, FraudEngineError> {
         let normalization = loader::load_json_file(resources_dir.join("normalization.json"))?;
         let mcc_risk = loader::load_json_file(resources_dir.join("mcc_risk.json"))?;
         let references = loader::load_example_refs(resources_dir)?;
 
-        Self::try_new(references, normalization, mcc_risk)
+        Self::try_new(references, normalization, mcc_risk, leaf_size)
     }
 
     fn try_new(
         references: Vec<StoredReference>,
         normalization: NormalizationConfig,
         mcc_risk: HashMap<String, f32>,
+        leaf_size: usize,
     ) -> Result<Self, FraudEngineError> {
+        if leaf_size == 0 {
+            return Err(FraudEngineError::Load(
+                "exact leaf size must be greater than zero".to_owned(),
+            ));
+        }
+
         if references.len() < K_NEIGHBORS {
             return Err(FraudEngineError::Load(format!(
                 "reference dataset must contain at least {K_NEIGHBORS} vectors, found {}",
@@ -33,7 +54,7 @@ impl FraudEngine {
             )));
         }
 
-        let index = search::build_index(&references);
+        let index = search::build_index(&references, leaf_size);
 
         Ok(Self {
             normalization,
