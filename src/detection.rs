@@ -467,7 +467,7 @@ fn build_exact_index(references: &[StoredReference]) -> ExactSearchIndex {
     let mut point_indices = (0..references.len() as u32).collect::<Vec<_>>();
 
     if !point_indices.is_empty() {
-        build_vp_node(references, &mut point_indices, &mut nodes, &mut indices);
+        build_vp_node(references, &mut point_indices, &mut nodes, &mut indices, 1);
     }
 
     ExactSearchIndex { nodes, indices }
@@ -478,6 +478,7 @@ fn build_vp_node(
     point_indices: &mut [u32],
     nodes: &mut Vec<VpNode>,
     leaf_indices: &mut Vec<u32>,
+    depth: usize,
 ) -> u32 {
     let node_idx = nodes.len() as u32;
     nodes.push(VpNode {
@@ -489,7 +490,7 @@ fn build_vp_node(
         len: 0,
     });
 
-    if point_indices.len() <= LEAF_SIZE {
+    if point_indices.len() <= LEAF_SIZE || depth >= EXACT_STACK_CAPACITY {
         finalize_leaf_node(nodes, node_idx, point_indices, leaf_indices);
         return node_idx;
     }
@@ -521,31 +522,32 @@ fn build_vp_node(
     });
 
     let radius = distances[median_position].dist;
-    let mut left_len = 0usize;
+    let mut left_count = 0usize;
 
     for point in &distances {
         if point.dist <= radius {
-            candidates[left_len] = point.idx;
-            left_len += 1;
+            candidates[left_count] = point.idx;
+            left_count += 1;
         }
     }
 
-    if left_len == 0 || left_len == distances.len() {
+    if left_count == 0 || left_count == distances.len() {
         finalize_leaf_node(nodes, node_idx, point_indices, leaf_indices);
         return node_idx;
     }
 
+    let mut write_pos = left_count;
+
     for point in &distances {
         if point.dist > radius {
-            candidates[left_len] = point.idx;
-            left_len += 1;
+            candidates[write_pos] = point.idx;
+            write_pos += 1;
         }
     }
 
-    let split_at = distances.iter().filter(|point| point.dist <= radius).count();
-    let (left_slice, right_slice) = candidates.split_at_mut(split_at);
-    let left = build_vp_node(references, left_slice, nodes, leaf_indices);
-    let right = build_vp_node(references, right_slice, nodes, leaf_indices);
+    let (left_slice, right_slice) = candidates.split_at_mut(left_count);
+    let left = build_vp_node(references, left_slice, nodes, leaf_indices, depth + 1);
+    let right = build_vp_node(references, right_slice, nodes, leaf_indices, depth + 1);
 
     nodes[node_idx as usize] = VpNode {
         pivot_idx,
@@ -893,14 +895,16 @@ unsafe fn l2_squared_avx2(left: &Vec16, right: &Vec16) -> f32 {
 
     let mut accumulated = _mm256_setzero_ps();
 
-    for offset in (0..PADDED_VECTOR_DIMENSIONS).step_by(8) {
-        let lhs = unsafe { _mm256_loadu_ps(left.0.as_ptr().add(offset)) };
-        let rhs = unsafe { _mm256_loadu_ps(right.0.as_ptr().add(offset)) };
-        let difference = _mm256_sub_ps(lhs, rhs);
-        accumulated = _mm256_fmadd_ps(difference, difference, accumulated);
-    }
+    unsafe {
+        for offset in (0..PADDED_VECTOR_DIMENSIONS).step_by(8) {
+            let lhs = _mm256_loadu_ps(left.0.as_ptr().add(offset));
+            let rhs = _mm256_loadu_ps(right.0.as_ptr().add(offset));
+            let difference = _mm256_sub_ps(lhs, rhs);
+            accumulated = _mm256_fmadd_ps(difference, difference, accumulated);
+        }
 
-    unsafe { horizontal_sum_m256(accumulated) }
+        horizontal_sum_m256(accumulated)
+    }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
