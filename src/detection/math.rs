@@ -110,39 +110,35 @@ pub fn l2_squared_scalar(left: &Vec16, right: &Vec16) -> f32 {
 
     total
 }
-#[target_feature(enable = "avx")]
-pub fn l2_squared_avx(left: &Vec16, right: &Vec16) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::{_mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps, _mm256_sub_ps};
 
-    let mut accumulated = _mm256_setzero_ps();
+#[inline]
+#[target_feature(enable = "avx,fma")]
+pub unsafe fn l2_squared_avx(left: &Vec16, right: &Vec16) -> f32 {
+    let lp = left.0.as_ptr();
+    let rp = right.0.as_ptr();
 
     unsafe {
-        for offset in (0..PADDED_VECTOR_DIMENSIONS).step_by(8) {
-            let lhs = _mm256_loadu_ps(left.0.as_ptr().add(offset));
-            let rhs = _mm256_loadu_ps(right.0.as_ptr().add(offset));
-            let difference = _mm256_sub_ps(lhs, rhs);
-            accumulated = _mm256_fmadd_ps(difference, difference, accumulated);
-        }
-
-        horizontal_sum_m256(accumulated)
+        use std::arch::x86_64::*;
+        let d0 = _mm256_sub_ps(_mm256_load_ps(lp), _mm256_load_ps(rp));
+        let d1 = _mm256_sub_ps(_mm256_load_ps(lp.add(8)), _mm256_load_ps(rp.add(8)));
+        let acc = _mm256_fmadd_ps(d0, d0, _mm256_mul_ps(d1, d1));
+        horizontal_sum_m256(acc)
     }
 }
 
 #[inline]
 #[target_feature(enable = "avx")]
-unsafe fn horizontal_sum_m256(
-    #[cfg(target_arch = "x86_64")] value: std::arch::x86_64::__m256,
-) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::{
-        _mm_add_ps, _mm_cvtss_f32, _mm_hadd_ps, _mm256_castps256_ps128, _mm256_extractf128_ps,
-    };
+unsafe fn horizontal_sum_m256(value: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
 
-    let lower = _mm256_castps256_ps128(value);
-    let upper = _mm256_extractf128_ps(value, 1);
-    let combined = _mm_add_ps(lower, upper);
-    let sum = _mm_hadd_ps(combined, combined);
-    let sum = _mm_hadd_ps(sum, sum);
-    _mm_cvtss_f32(sum)
+    let lo = _mm256_castps256_ps128(value);
+    let hi = _mm256_extractf128_ps(value, 1);
+
+    let sum = _mm_add_ps(lo, hi);
+    let shuf = _mm_shuffle_ps(sum, sum, 0b_10_11_00_01);
+    let sums = _mm_add_ps(sum, shuf);
+    let shuf = _mm_movehl_ps(shuf, sums);
+    let sums = _mm_add_ss(sums, shuf);
+
+    _mm_cvtss_f32(sums)
 }
