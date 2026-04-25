@@ -22,6 +22,7 @@ const LEAF_SIZE: usize = 32;
 const VP_NONE: u32 = u32::MAX;
 const EXACT_STACK_CAPACITY: usize = 256;
 const PIVOT_SAMPLE_SIZE: usize = 64;
+const EPSILON: f32 = 1e-6;
 
 #[repr(align(32))]
 #[derive(Debug, Clone, Copy)]
@@ -689,7 +690,16 @@ fn search_exact_knn_with_distance(
             (node.right, node.left)
         };
 
-        if far != VP_NONE && (pivot_distance - node.radius).abs() <= result.worst_distance(neighbors) {
+        let can_visit_far = if far == VP_NONE {
+            false
+        } else if result.found < neighbors {
+            true
+        } else {
+            let worst_distance = result.worst_distance(neighbors);
+            (pivot_distance.sqrt() - node.radius.sqrt()).abs() <= worst_distance.sqrt() + EPSILON
+        };
+
+        if can_visit_far {
             push_stack(&mut stack, &mut stack_len, far);
         }
 
@@ -846,6 +856,8 @@ impl ExactKnnResult {
         self.best_distances[insert_at] = distance;
         self.best_indices[insert_at] = idx;
         self.found = (self.found + 1).min(neighbors);
+
+        debug_assert!(self.best_distances.windows(2).all(|window| window[0] <= window[1]));
     }
 
     fn worst_distance(&self, neighbors: usize) -> f32 {
@@ -1006,6 +1018,40 @@ mod tests {
             references,
             search_index,
         }
+    }
+
+    fn next_random_unit(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+
+        ((*state >> 32) as u32) as f32 / u32::MAX as f32
+    }
+
+    fn generate_random_dataset(len: usize, seed: u64) -> Vec<StoredReference> {
+        let mut state = seed;
+
+        (0..len)
+            .map(|index| {
+                let mut vector = [0.0; VECTOR_DIMENSIONS];
+
+                for value in &mut vector {
+                    *value = next_random_unit(&mut state);
+                }
+
+                test_reference(vector, index % 3 == 0)
+            })
+            .collect()
+    }
+
+    fn random_query(state: &mut u64) -> [f32; VECTOR_DIMENSIONS] {
+        let mut query = [0.0; VECTOR_DIMENSIONS];
+
+        for value in &mut query {
+            *value = next_random_unit(state);
+        }
+
+        query
     }
 
     fn exact_index(engine: &FraudEngine) -> &ExactSearchIndex {
@@ -1186,5 +1232,28 @@ mod tests {
         assert!(exact.best_distances[..exact.found]
             .iter()
             .all(|distance| *distance == 0.0));
+    }
+
+    #[test]
+    fn vp_tree_exact_search_matches_bruteforce_across_large_random_dataset() {
+        let engine = synthetic_engine(generate_random_dataset(4_096, 0x5eed_f00d_dead_beef));
+        let mut query_state = 0x1234_5678_9abc_def0;
+
+        for _ in 0..256 {
+            let query = random_query(&mut query_state);
+            let exact = search_exact_knn(&engine.references, exact_index(&engine), &query, K_NEIGHBORS);
+            let brute_force = brute_force_knn(&engine.references, &query, K_NEIGHBORS);
+
+            assert_eq!(exact.found, brute_force.found);
+            assert_eq!(exact.best_indices, brute_force.best_indices);
+
+            for (left, right) in exact
+                .best_distances
+                .iter()
+                .zip(brute_force.best_distances.iter())
+            {
+                assert!((left - right).abs() < 0.0001);
+            }
+        }
     }
 }
