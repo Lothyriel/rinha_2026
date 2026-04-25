@@ -1,4 +1,4 @@
-use std::{fs, net::SocketAddr, path::Path, sync::Arc};
+use std::{fs, net::SocketAddr, os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 
 use rinha_2026::{app, detection};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -38,6 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let listener = tokio::net::UnixListener::bind(socket_path)?;
+        let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666));
 
         tracing::info!(
             socket_path = %socket_path.display(),
