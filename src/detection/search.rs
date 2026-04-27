@@ -10,8 +10,8 @@ impl FraudEngine {
     }
 
     fn classify_exact(&self, query: &[f32; VECTOR_DIMENSIONS], neighbors: usize) -> (usize, usize) {
-        let result = search_exact_knn(&self.references, &self.index, query, neighbors);
-        (result.found, result.fraud_votes(&self.references))
+        let result = search_exact_knn(&self.dataset, query, neighbors);
+        (result.found, result.fraud_votes(&self.dataset))
     }
 }
 
@@ -185,28 +185,27 @@ fn choose_pivot_position(references: &[StoredReference], point_indices: &[u32]) 
 }
 
 pub fn search_exact_knn(
-    references: &[StoredReference],
-    index: &ExactSearchIndex,
+    dataset: &DatasetStorage,
     query: &[f32; VECTOR_DIMENSIONS],
     neighbors: usize,
 ) -> ExactKnnResult {
     let query = Vec16::from_query(query);
 
-    search_exact_knn_with_distance(references, index, &query, neighbors, |left, right| unsafe {
+    search_exact_knn_with_distance(dataset, &query, neighbors, |left, right| unsafe {
         math::l2_squared_avx(left, right)
     })
 }
 
 fn search_exact_knn_with_distance(
-    references: &[StoredReference],
-    index: &ExactSearchIndex,
+    dataset: &DatasetStorage,
     query: &Vec16,
     neighbors: usize,
     distance_fn: impl Fn(&Vec16, &Vec16) -> f32,
 ) -> ExactKnnResult {
     let mut result = ExactKnnResult::new();
+    let nodes = dataset.nodes();
 
-    if index.nodes.is_empty() || neighbors == 0 {
+    if nodes.is_empty() || neighbors == 0 {
         return result;
     }
 
@@ -216,15 +215,14 @@ fn search_exact_knn_with_distance(
 
     while stack_len > 0 {
         stack_len -= 1;
-        let node = &index.nodes[stack[stack_len] as usize];
+        let node = &nodes[stack[stack_len] as usize];
 
         if node.len > 0 {
             let leaf_start = node.start as usize;
             let leaf_end = leaf_start + node.len as usize;
 
-            for &reference_idx in &index.indices[leaf_start..leaf_end] {
-                let distance =
-                    distance_fn(query, &references[reference_idx as usize].padded_vector);
+            for &reference_idx in &dataset.indices()[leaf_start..leaf_end] {
+                let distance = distance_fn(query, dataset.vector(reference_idx as usize));
                 result.insert(reference_idx, distance, neighbors);
             }
 
@@ -232,7 +230,7 @@ fn search_exact_knn_with_distance(
         }
 
         let pivot_idx = node.pivot_idx as usize;
-        let pivot_distance = distance_fn(query, &references[pivot_idx].padded_vector);
+        let pivot_distance = distance_fn(query, dataset.vector(pivot_idx));
         result.insert(node.pivot_idx, pivot_distance, neighbors);
 
         let (near, far) = if pivot_distance <= node.radius {
@@ -289,17 +287,17 @@ mod tests {
     }
 
     fn brute_force_knn(
-        references: &[StoredReference],
+        dataset: &DatasetStorage,
         query: &[f32; VECTOR_DIMENSIONS],
         neighbors: usize,
     ) -> ExactKnnResult {
         let query = Vec16::from_query(query);
         let mut result = ExactKnnResult::new();
 
-        for (index, reference) in references.iter().enumerate() {
+        for index in 0..dataset.len() {
             result.insert(
                 index as u32,
-                math::l2_squared_scalar(&query, &reference.padded_vector),
+                math::l2_squared_scalar(&query, dataset.vector(index)),
                 neighbors,
             );
         }
@@ -321,8 +319,7 @@ mod tests {
                 max_merchant_avg_amount: 1.0,
             },
             mcc_risk: HashMap::new(),
-            references,
-            index,
+            dataset: DatasetStorage::Owned(OwnedDataset { references, index }),
         }
     }
 
@@ -387,8 +384,8 @@ mod tests {
         ];
 
         for query in queries {
-            let exact = search_exact_knn(&engine.references, &engine.index, &query, K_NEIGHBORS);
-            let brute_force = brute_force_knn(&engine.references, &query, K_NEIGHBORS);
+            let exact = search_exact_knn(&engine.dataset, &query, K_NEIGHBORS);
+            let brute_force = brute_force_knn(&engine.dataset, &query, K_NEIGHBORS);
 
             assert_eq!(exact.found, brute_force.found);
             assert_eq!(exact.best_indices, brute_force.best_indices);
@@ -411,12 +408,11 @@ mod tests {
         let engine = synthetic_engine(references);
         let query = [0.25; VECTOR_DIMENSIONS];
 
-        let index = &engine.index;
-        let exact = search_exact_knn(&engine.references, index, &query, K_NEIGHBORS);
+        let exact = search_exact_knn(&engine.dataset, &query, K_NEIGHBORS);
 
         assert_eq!(exact.found, K_NEIGHBORS);
-        assert_eq!(index.nodes.len(), 1);
-        assert_eq!(index.nodes[0].len, 48);
+        assert_eq!(engine.dataset.nodes().len(), 1);
+        assert_eq!(engine.dataset.nodes()[0].len, 48);
         assert!(
             exact.best_distances[..exact.found]
                 .iter()
@@ -431,8 +427,8 @@ mod tests {
 
         for _ in 0..256 {
             let query = random_query(&mut query_state);
-            let exact = search_exact_knn(&engine.references, &engine.index, &query, K_NEIGHBORS);
-            let brute_force = brute_force_knn(&engine.references, &query, K_NEIGHBORS);
+            let exact = search_exact_knn(&engine.dataset, &query, K_NEIGHBORS);
+            let brute_force = brute_force_knn(&engine.dataset, &query, K_NEIGHBORS);
 
             assert_eq!(exact.found, brute_force.found);
             assert_eq!(exact.best_indices, brute_force.best_indices);

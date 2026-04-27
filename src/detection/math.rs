@@ -86,14 +86,12 @@ impl ExactKnnResult {
         }
     }
 
-    pub fn fraud_votes(&self, references: &[StoredReference]) -> usize {
+    pub fn fraud_votes(&self, dataset: &DatasetStorage) -> usize {
         self.best_indices[..self.found]
             .iter()
             .filter(|&&idx| {
                 idx != VP_NONE
-                    && references
-                        .get(idx as usize)
-                        .is_some_and(|reference| reference.label == ReferenceLabel::Fraud)
+                    && dataset.label(idx as usize) == ReferenceLabel::Fraud
             })
             .count()
     }

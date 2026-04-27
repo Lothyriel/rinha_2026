@@ -26,6 +26,14 @@ RINHA_UNIX_SOCKET_PATH=/tmp/rinha-api.sock cargo run
 
 Quando `RINHA_UNIX_SOCKET_PATH` está definido, a API passa a escutar apenas no socket informado. Quando não está definido, o comportamento padrão continua sendo TCP na porta `9999`.
 
+Para compartilhar o dataset/index entre processos via arquivo `mmap`:
+
+```bash
+RINHA_SHARED_MMAP_PATH=/tmp/rinha-shared-dataset.bin cargo run
+```
+
+O primeiro processo cria o arquivo mapeado e os próximos apenas o reutilizam em modo leitura.
+
 ## Testes
 
 ```bash

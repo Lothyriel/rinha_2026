@@ -15,9 +15,25 @@ impl FraudEngine {
     ) -> Result<Self, FraudEngineError> {
         let normalization = loader::load_json_file(resources_dir.join("normalization.json"))?;
         let mcc_risk = loader::load_json_file(resources_dir.join("mcc_risk.json"))?;
-        let references = loader::load_refs(resources_dir)?;
 
-        Self::try_new(references, normalization, mcc_risk, leaf_size)
+        let dataset = if let Some(shared_path) = std::env::var("RINHA_SHARED_MMAP_PATH")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+        {
+            DatasetStorage::Shared(shared::load_or_create_mapped_dataset(
+                resources_dir,
+                Path::new(&shared_path),
+                leaf_size,
+            )?)
+        } else {
+            let references = loader::load_refs(resources_dir)?;
+            let index = search::build_index(&references, leaf_size);
+
+            DatasetStorage::Owned(OwnedDataset { references, index })
+        };
+
+        Self::try_new(dataset, normalization, mcc_risk, leaf_size)
     }
 
     pub fn load_example(resources_dir: &Path) -> Result<Self, FraudEngineError> {
@@ -31,12 +47,18 @@ impl FraudEngine {
         let normalization = loader::load_json_file(resources_dir.join("normalization.json"))?;
         let mcc_risk = loader::load_json_file(resources_dir.join("mcc_risk.json"))?;
         let references = loader::load_example_refs(resources_dir)?;
+        let index = search::build_index(&references, leaf_size);
 
-        Self::try_new(references, normalization, mcc_risk, leaf_size)
+        Self::try_new(
+            DatasetStorage::Owned(OwnedDataset { references, index }),
+            normalization,
+            mcc_risk,
+            leaf_size,
+        )
     }
 
     fn try_new(
-        references: Vec<StoredReference>,
+        dataset: DatasetStorage,
         normalization: NormalizationConfig,
         mcc_risk: HashMap<String, f32>,
         leaf_size: usize,
@@ -47,20 +69,17 @@ impl FraudEngine {
             ));
         }
 
-        if references.len() < K_NEIGHBORS {
+        if dataset.len() < K_NEIGHBORS {
             return Err(FraudEngineError::Load(format!(
                 "reference dataset must contain at least {K_NEIGHBORS} vectors, found {}",
-                references.len()
+                dataset.len()
             )));
         }
-
-        let index = search::build_index(&references, leaf_size);
 
         Ok(Self {
             normalization,
             mcc_risk,
-            references,
-            index,
+            dataset,
         })
     }
 
@@ -87,6 +106,6 @@ impl FraudEngine {
     }
 
     pub fn reference_count(&self) -> usize {
-        self.references.len()
+        self.dataset.len()
     }
 }

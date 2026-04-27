@@ -6,6 +6,7 @@ mod engine;
 mod loader;
 mod math;
 mod search;
+mod shared;
 mod vectorize;
 
 const K_NEIGHBORS: usize = 5;
@@ -18,10 +19,11 @@ const EXACT_STACK_CAPACITY: usize = 256;
 const PIVOT_SAMPLE_SIZE: usize = 64;
 const EPSILON: f32 = 1e-6;
 
-#[repr(align(32))]
+#[repr(C, align(32))]
 #[derive(Debug, Clone, Copy)]
 struct Vec16([f32; PADDED_VECTOR_DIMENSIONS]);
 
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct VpNode {
     pivot_idx: u32,
@@ -32,7 +34,7 @@ struct VpNode {
     len: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ExactSearchIndex {
     nodes: Vec<VpNode>,
     indices: Vec<u32>,
@@ -78,23 +80,87 @@ struct RawReferenceEntry {
     label: ReferenceLabel,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[repr(u8)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 enum ReferenceLabel {
     Fraud,
     Legit,
 }
 
-#[derive(Debug)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
 struct StoredReference {
     padded_vector: Vec16,
     label: ReferenceLabel,
 }
 
 #[derive(Debug)]
+struct OwnedDataset {
+    references: Vec<StoredReference>,
+    index: ExactSearchIndex,
+}
+
+#[derive(Debug)]
+enum DatasetStorage {
+    Owned(OwnedDataset),
+    Shared(shared::MappedDataset),
+}
+
+#[derive(Debug)]
 pub struct FraudEngine {
     normalization: NormalizationConfig,
     mcc_risk: HashMap<String, f32>,
-    references: Vec<StoredReference>,
-    index: ExactSearchIndex,
+    dataset: DatasetStorage,
+}
+
+impl ReferenceLabel {
+    fn from_storage_byte(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Fraud),
+            1 => Some(Self::Legit),
+            _ => None,
+        }
+    }
+
+    fn to_storage_byte(self) -> u8 {
+        self as u8
+    }
+}
+
+impl DatasetStorage {
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(dataset) => dataset.references.len(),
+            Self::Shared(dataset) => dataset.len(),
+        }
+    }
+
+    fn vector(&self, index: usize) -> &Vec16 {
+        match self {
+            Self::Owned(dataset) => &dataset.references[index].padded_vector,
+            Self::Shared(dataset) => dataset.vector(index),
+        }
+    }
+
+    fn label(&self, index: usize) -> ReferenceLabel {
+        match self {
+            Self::Owned(dataset) => dataset.references[index].label,
+            Self::Shared(dataset) => dataset.label(index),
+        }
+    }
+
+    fn nodes(&self) -> &[VpNode] {
+        match self {
+            Self::Owned(dataset) => &dataset.index.nodes,
+            Self::Shared(dataset) => dataset.nodes(),
+        }
+    }
+
+    fn indices(&self) -> &[u32] {
+        match self {
+            Self::Owned(dataset) => &dataset.index.indices,
+            Self::Shared(dataset) => dataset.indices(),
+        }
+    }
 }
