@@ -70,7 +70,7 @@ pub fn parse_utc_timestamp(value: &str) -> Result<DateTime<Utc>, FraudEngineErro
 impl From<RawReferenceEntry> for StoredReference {
     fn from(value: RawReferenceEntry) -> Self {
         Self {
-            padded_vector: Vec16::from_vector(value.vector),
+            padded_vector: QuantizedVec16::from_vector(value.vector),
             label: value.label,
         }
     }
