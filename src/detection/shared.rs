@@ -125,7 +125,7 @@ impl MappedDataset {
         self.header.reference_count as usize
     }
 
-    pub fn vector(&self, index: usize) -> &QuantizedVec16 {
+    pub fn vector(&self, index: usize) -> &Vec16 {
         &self.vectors()[index]
     }
 
@@ -142,7 +142,7 @@ impl MappedDataset {
         self.slice_from_offset(self.header.indices_offset, self.header.index_count as usize)
     }
 
-    fn vectors(&self) -> &[QuantizedVec16] {
+    fn vectors(&self) -> &[Vec16] {
         self.slice_from_offset(self.header.vectors_offset, self.header.reference_count as usize)
     }
 
@@ -210,7 +210,7 @@ fn validate_header(mmap: &Mmap, leaf_size: usize) -> Result<SharedDatasetHeader,
         ));
     }
 
-    validate_region::<QuantizedVec16>(&header, header.vectors_offset, header.reference_count)?;
+    validate_region::<Vec16>(&header, header.vectors_offset, header.reference_count)?;
     validate_region::<u8>(&header, header.labels_offset, header.reference_count)?;
     validate_region::<VpNode>(&header, header.nodes_offset, header.node_count)?;
     validate_region::<u32>(&header, header.indices_offset, header.index_count)?;
@@ -327,12 +327,9 @@ fn write_dataset_file(
     index: &ExactSearchIndex,
     leaf_size: usize,
 ) -> Result<(), FraudEngineError> {
-    let vectors_offset = align_up(
-        size_of::<SharedDatasetHeader>() as u64,
-        align_of::<QuantizedVec16>() as u64,
-    );
+    let vectors_offset = align_up(size_of::<SharedDatasetHeader>() as u64, align_of::<Vec16>() as u64);
     let labels_offset = align_up(
-        vectors_offset + byte_len::<QuantizedVec16>(references.len())?,
+        vectors_offset + byte_len::<Vec16>(references.len())?,
         align_of::<u8>() as u64,
     );
     let nodes_offset = align_up(
@@ -554,7 +551,7 @@ mod tests {
 
     fn test_reference(vector: [f32; VECTOR_DIMENSIONS], label: ReferenceLabel) -> StoredReference {
         StoredReference {
-            padded_vector: QuantizedVec16::from_vector(vector),
+            padded_vector: Vec16::from_vector(vector),
             label,
         }
     }

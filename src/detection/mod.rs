@@ -17,17 +17,17 @@ const LEAF_SIZE: usize = 8;
 const VP_NONE: u32 = u32::MAX;
 const EXACT_STACK_CAPACITY: usize = 256;
 const PIVOT_SAMPLE_SIZE: usize = 64;
-const QUANTIZATION_SCALE: f32 = 32_767.0;
+const EPSILON: f32 = 1e-6;
 
 #[repr(C, align(32))]
 #[derive(Debug, Clone, Copy)]
-struct QuantizedVec16([i16; PADDED_VECTOR_DIMENSIONS]);
+struct Vec16([f32; PADDED_VECTOR_DIMENSIONS]);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct VpNode {
     pivot_idx: u32,
-    radius: u64,
+    radius: f32,
     left: u32,
     right: u32,
     start: u32,
@@ -42,7 +42,7 @@ struct ExactSearchIndex {
 
 #[derive(Debug, Clone, Copy)]
 struct ExactKnnResult {
-    best_distances: [u64; K_NEIGHBORS],
+    best_distances: [f32; K_NEIGHBORS],
     best_indices: [u32; K_NEIGHBORS],
     found: usize,
 }
@@ -50,7 +50,7 @@ struct ExactKnnResult {
 #[derive(Debug, Clone, Copy)]
 struct PointDistance {
     idx: u32,
-    dist: u64,
+    dist: f32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -91,7 +91,7 @@ enum ReferenceLabel {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct StoredReference {
-    padded_vector: QuantizedVec16,
+    padded_vector: Vec16,
     label: ReferenceLabel,
 }
 
@@ -143,7 +143,7 @@ impl DatasetStorage {
         }
     }
 
-    fn vector(&self, index: usize) -> &QuantizedVec16 {
+    fn vector(&self, index: usize) -> &Vec16 {
         match self {
             Self::Owned(dataset) => &dataset.references[index].padded_vector,
             Self::Shared(dataset) => dataset.vector(index),

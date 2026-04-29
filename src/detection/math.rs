@@ -28,45 +28,30 @@ pub fn bool_to_unit(value: bool) -> f32 {
     if value { 1.0 } else { 0.0 }
 }
 
-impl QuantizedVec16 {
+impl Vec16 {
     pub fn from_vector(vector: [f32; VECTOR_DIMENSIONS]) -> Self {
-        let mut padded = [0i16; PADDED_VECTOR_DIMENSIONS];
-
-        for (index, value) in vector.into_iter().enumerate() {
-            padded[index] = quantize_component(value);
-        }
-
+        let mut padded = [0.0; PADDED_VECTOR_DIMENSIONS];
+        padded[..VECTOR_DIMENSIONS].copy_from_slice(&vector);
         Self(padded)
     }
 
     pub fn from_query(vector: &[f32; VECTOR_DIMENSIONS]) -> Self {
-        let mut padded = [0i16; PADDED_VECTOR_DIMENSIONS];
-
-        for (index, value) in vector.iter().copied().enumerate() {
-            padded[index] = quantize_component(value);
-        }
-
+        let mut padded = [0.0; PADDED_VECTOR_DIMENSIONS];
+        padded[..VECTOR_DIMENSIONS].copy_from_slice(vector);
         Self(padded)
     }
-}
-
-#[inline]
-fn quantize_component(value: f32) -> i16 {
-    let clamped = value.clamp(-1.0, 1.0);
-    let scaled = (clamped * QUANTIZATION_SCALE).round();
-    scaled.clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
 impl ExactKnnResult {
     pub fn new() -> Self {
         Self {
-            best_distances: [u64::MAX; K_NEIGHBORS],
+            best_distances: [f32::INFINITY; K_NEIGHBORS],
             best_indices: [VP_NONE; K_NEIGHBORS],
             found: 0,
         }
     }
 
-    pub fn insert(&mut self, idx: u32, distance: u64, neighbors: usize) {
+    pub fn insert(&mut self, idx: u32, distance: f32, neighbors: usize) {
         let insert_at = self
             .best_distances
             .partition_point(|current| *current < distance);
@@ -93,9 +78,9 @@ impl ExactKnnResult {
         );
     }
 
-    pub fn worst_distance(&self, neighbors: usize) -> u64 {
+    pub fn worst_distance(&self, neighbors: usize) -> f32 {
         if self.found < neighbors {
-            u64::MAX
+            f32::INFINITY
         } else {
             self.best_distances[neighbors - 1]
         }
@@ -113,13 +98,45 @@ impl ExactKnnResult {
 }
 
 #[inline]
-pub fn l2_squared_scalar(left: &QuantizedVec16, right: &QuantizedVec16) -> u64 {
-    let mut total = 0u64;
+pub fn l2_squared_scalar(left: &Vec16, right: &Vec16) -> f32 {
+    let mut total = 0.0f32;
 
     for index in 0..PADDED_VECTOR_DIMENSIONS {
-        let difference = left.0[index] as i64 - right.0[index] as i64;
-        total += (difference * difference) as u64;
+        let difference = left.0[index] - right.0[index];
+        total += difference * difference;
     }
 
     total
+}
+
+#[inline]
+#[target_feature(enable = "avx,fma")]
+pub unsafe fn l2_squared_avx(left: &Vec16, right: &Vec16) -> f32 {
+    let lp = left.0.as_ptr();
+    let rp = right.0.as_ptr();
+
+    unsafe {
+        use std::arch::x86_64::*;
+        let d0 = _mm256_sub_ps(_mm256_load_ps(lp), _mm256_load_ps(rp));
+        let d1 = _mm256_sub_ps(_mm256_load_ps(lp.add(8)), _mm256_load_ps(rp.add(8)));
+        let acc = _mm256_fmadd_ps(d0, d0, _mm256_mul_ps(d1, d1));
+        horizontal_sum_m256(acc)
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx")]
+unsafe fn horizontal_sum_m256(value: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+
+    let lo = _mm256_castps256_ps128(value);
+    let hi = _mm256_extractf128_ps(value, 1);
+
+    let sum = _mm_add_ps(lo, hi);
+    let shuf = _mm_shuffle_ps(sum, sum, 0b_10_11_00_01);
+    let sums = _mm_add_ps(sum, shuf);
+    let shuf = _mm_movehl_ps(shuf, sums);
+    let sums = _mm_add_ss(sums, shuf);
+
+    _mm_cvtss_f32(sums)
 }

@@ -45,7 +45,7 @@ fn build_vp_node(
     let node_idx = nodes.len() as u32;
     nodes.push(VpNode {
         pivot_idx: VP_NONE,
-        radius: 0,
+        radius: 0.0,
         left: VP_NONE,
         right: VP_NONE,
         start: 0,
@@ -79,7 +79,9 @@ fn build_vp_node(
         .collect::<Vec<_>>();
 
     let median_position = distances.len() / 2;
-    distances.select_nth_unstable_by(median_position, |left, right| left.dist.cmp(&right.dist));
+    distances.select_nth_unstable_by(median_position, |left, right| {
+        left.dist.total_cmp(&right.dist)
+    });
 
     let radius = distances[median_position].dist;
     let mut left_count = 0usize;
@@ -131,7 +133,7 @@ fn finalize_leaf_node(
     leaf_indices.extend_from_slice(point_indices);
     nodes[node_idx as usize] = VpNode {
         pivot_idx: VP_NONE,
-        radius: 0,
+        radius: 0.0,
         left: VP_NONE,
         right: VP_NONE,
         start,
@@ -154,11 +156,11 @@ fn choose_pivot_position(references: &[StoredReference], point_indices: &[u32]) 
     }
 
     let mut best_position = sampled_positions[0];
-    let mut best_mean_distance = f64::NEG_INFINITY;
+    let mut best_mean_distance = f32::NEG_INFINITY;
 
     for &candidate_position in sampled_positions.iter().take(sample_len) {
         let candidate = &references[point_indices[candidate_position] as usize].padded_vector;
-        let mut total_distance = 0u64;
+        let mut total_distance = 0.0f32;
 
         for &comparison_position in sampled_positions.iter().take(sample_len) {
             if comparison_position == candidate_position {
@@ -171,7 +173,7 @@ fn choose_pivot_position(references: &[StoredReference], point_indices: &[u32]) 
             );
         }
 
-        let mean_distance = total_distance as f64 / sample_len.saturating_sub(1) as f64;
+        let mean_distance = total_distance / (sample_len.saturating_sub(1) as f32);
 
         if mean_distance > best_mean_distance {
             best_mean_distance = mean_distance;
@@ -187,16 +189,18 @@ pub fn search_exact_knn(
     query: &[f32; VECTOR_DIMENSIONS],
     neighbors: usize,
 ) -> ExactKnnResult {
-    let query = QuantizedVec16::from_query(query);
+    let query = Vec16::from_query(query);
 
-    search_exact_knn_with_distance(dataset, &query, neighbors, math::l2_squared_scalar)
+    search_exact_knn_with_distance(dataset, &query, neighbors, |left, right| unsafe {
+        math::l2_squared_avx(left, right)
+    })
 }
 
 fn search_exact_knn_with_distance(
     dataset: &DatasetStorage,
-    query: &QuantizedVec16,
+    query: &Vec16,
     neighbors: usize,
-    distance_fn: impl Fn(&QuantizedVec16, &QuantizedVec16) -> u64,
+    distance_fn: impl Fn(&Vec16, &Vec16) -> f32,
 ) -> ExactKnnResult {
     let mut result = ExactKnnResult::new();
     let nodes = dataset.nodes();
@@ -241,11 +245,7 @@ fn search_exact_knn_with_distance(
             true
         } else {
             let worst_distance = result.worst_distance(neighbors);
-            let pivot_norm = (pivot_distance as f64).sqrt();
-            let radius_norm = (node.radius as f64).sqrt();
-            let worst_norm = (worst_distance as f64).sqrt();
-
-            (pivot_norm - radius_norm).abs() <= worst_norm
+            (pivot_distance.sqrt() - node.radius.sqrt()).abs() <= worst_distance.sqrt() + EPSILON
         };
 
         if can_visit_far {
@@ -277,7 +277,7 @@ mod tests {
 
     fn test_reference(vector: [f32; VECTOR_DIMENSIONS], is_fraud: bool) -> StoredReference {
         StoredReference {
-            padded_vector: QuantizedVec16::from_vector(vector),
+            padded_vector: Vec16::from_vector(vector),
             label: if is_fraud {
                 ReferenceLabel::Fraud
             } else {
@@ -291,7 +291,7 @@ mod tests {
         query: &[f32; VECTOR_DIMENSIONS],
         neighbors: usize,
     ) -> ExactKnnResult {
-        let query = QuantizedVec16::from_query(query);
+        let query = Vec16::from_query(query);
         let mut result = ExactKnnResult::new();
 
         for index in 0..dataset.len() {
@@ -395,7 +395,7 @@ mod tests {
                 .iter()
                 .zip(brute_force.best_distances.iter())
             {
-                assert_eq!(left, right);
+                assert!((left - right).abs() < 0.0001);
             }
         }
     }
@@ -416,7 +416,7 @@ mod tests {
         assert!(
             exact.best_distances[..exact.found]
                 .iter()
-                .all(|distance| *distance == 0)
+                .all(|distance| *distance == 0.0)
         );
     }
 
@@ -438,7 +438,7 @@ mod tests {
                 .iter()
                 .zip(brute_force.best_distances.iter())
             {
-                assert_eq!(left, right);
+                assert!((left - right).abs() < 0.0001);
             }
         }
     }
