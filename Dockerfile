@@ -17,7 +17,9 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY Cargo.toml ./
 COPY src ./src
 COPY ./spec/resources ./spec/resources
-RUN cargo build --release
+RUN cargo build --release --bin rinha_2026 --bin prebuild_shared_dataset
+RUN mkdir -p /app/prebuilt \
+  && /app/target/release/prebuild_shared_dataset /app/spec/resources /app/prebuilt/index.mmap
 
 FROM debian:trixie-slim
 
@@ -29,6 +31,7 @@ RUN apt-get update \
 
 COPY --from=builder /app/target/release/rinha_2026 /usr/local/bin/rinha-api
 COPY ./spec/resources /app/resources
+COPY --from=builder /app/prebuilt/index.mmap /app/resources/index.mmap
 
 ENV PORT=9999
 ENV RINHA_RESOURCES_DIR=/app/resources

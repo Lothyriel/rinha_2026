@@ -269,7 +269,7 @@ fn validate_region<T>(
     Ok(())
 }
 
-fn build_shared_dataset_file(
+pub(super) fn build_shared_dataset_file(
     resources_dir: &Path,
     mmap_path: &Path,
     leaf_size: usize,

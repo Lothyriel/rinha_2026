@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::Path};
 
 use serde::Deserialize;
 
@@ -112,6 +112,13 @@ pub struct FraudEngine {
     normalization: NormalizationConfig,
     mcc_risk: HashMap<String, f32>,
     dataset: DatasetStorage,
+}
+
+pub fn prebuild_shared_dataset(
+    resources_dir: &Path,
+    mmap_path: &Path,
+) -> Result<(), FraudEngineError> {
+    shared::build_shared_dataset_file(resources_dir, mmap_path, LEAF_SIZE)
 }
 
 impl ReferenceLabel {

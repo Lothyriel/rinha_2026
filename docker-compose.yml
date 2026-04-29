@@ -1,9 +1,11 @@
 x-api-template: &api-template
-  image: ghcr.io/lothyriel/rinha_2026:v0.4.1
+  image: localhost/rinha_2026_local:latest
+  build:
+    context: .
+    dockerfile: Dockerfile
   platform: linux/amd64
   volumes:
     - sockets:/sockets
-    - shared:/shared
   healthcheck:
     test:
       [
@@ -27,14 +29,14 @@ services:
     environment:
       RINHA_RESOURCES_DIR: /app/resources
       RINHA_UNIX_SOCKET_PATH: /sockets/api-1.sock
-      RINHA_SHARED_MMAP_PATH: /shared/index.mmap
+      RINHA_SHARED_MMAP_PATH: /app/resources/index.mmap
 
   api-2:
     <<: *api-template
     environment:
       RINHA_RESOURCES_DIR: /app/resources
       RINHA_UNIX_SOCKET_PATH: /sockets/api-2.sock
-      RINHA_SHARED_MMAP_PATH: /shared/index.mmap
+      RINHA_SHARED_MMAP_PATH: /app/resources/index.mmap
 
   load-balancer:
     image: nginx:1.30-alpine
@@ -68,4 +70,3 @@ volumes:
       type: tmpfs
       device: tmpfs
       o: "size=4m,mode=0777"
-  shared:
