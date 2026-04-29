@@ -1,5 +1,5 @@
 x-api-template: &api-template
-  image: ghcr.io/lothyriel/rinha_2026:v0.4.3
+  image: ghcr.io/lothyriel/rinha_2026:v0.5.0
   platform: linux/amd64
   volumes:
     - sockets:/sockets
@@ -17,7 +17,7 @@ x-api-template: &api-template
   deploy:
     resources:
       limits:
-        cpus: "0.35"
+        cpus: "0.3"
         memory: 150MB
 
 services:
@@ -26,14 +26,12 @@ services:
     environment:
       RINHA_RESOURCES_DIR: /app/resources
       RINHA_UNIX_SOCKET_PATH: /sockets/api-1.sock
-      RINHA_SHARED_MMAP_PATH: /app/resources/index.mmap
 
   api-2:
     <<: *api-template
     environment:
       RINHA_RESOURCES_DIR: /app/resources
       RINHA_UNIX_SOCKET_PATH: /sockets/api-2.sock
-      RINHA_SHARED_MMAP_PATH: /app/resources/index.mmap
 
   load-balancer:
     image: nginx:1.30-alpine
@@ -58,7 +56,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.3"
+          cpus: "0.4"
           memory: 50MB
 
 volumes:
