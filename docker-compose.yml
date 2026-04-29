@@ -1,5 +1,5 @@
 x-api-template: &api-template
-  image: ghcr.io/lothyriel/rinha_2026:v0.4.1
+  image: ghcr.io/lothyriel/rinha_2026:v0.4.2
   platform: linux/amd64
   volumes:
     - sockets:/sockets
@@ -18,7 +18,7 @@ x-api-template: &api-template
   deploy:
     resources:
       limits:
-        cpus: "0.35"
+        cpus: "0.275"
         memory: 150MB
 
 services:
@@ -59,7 +59,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.3"
+          cpus: "0.45"
           memory: 50MB
 
 volumes:
