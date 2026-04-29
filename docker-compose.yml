@@ -26,12 +26,14 @@ services:
     environment:
       RINHA_RESOURCES_DIR: /app/resources
       RINHA_UNIX_SOCKET_PATH: /sockets/api-1.sock
+      RINHA_SHARED_MMAP_PATH: /shared/index.mmap
 
   api-2:
     <<: *api-template
     environment:
       RINHA_RESOURCES_DIR: /app/resources
       RINHA_UNIX_SOCKET_PATH: /sockets/api-2.sock
+      RINHA_SHARED_MMAP_PATH: /shared/index.mmap
 
   load-balancer:
     image: nginx:1.30-alpine
@@ -65,3 +67,4 @@ volumes:
       type: tmpfs
       device: tmpfs
       o: "size=4m,mode=0777"
+  shared:
