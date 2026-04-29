@@ -1,6 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
-    io,
+    io::{self, Write},
     mem::{align_of, size_of},
     path::{Path, PathBuf},
     ptr,
@@ -45,21 +45,51 @@ pub fn load_or_create_mapped_dataset(
     mmap_path: &Path,
     leaf_size: usize,
 ) -> Result<MappedDataset, FraudEngineError> {
+    let actor = current_actor();
+
     if let Some(dataset) = try_open_mapped_dataset(mmap_path, leaf_size)? {
+        tracing::info!(
+            actor = %actor,
+            mmap_path = %mmap_path.display(),
+            "shared dataset mmap already available"
+        );
         return Ok(dataset);
     }
 
     let lock_path = lock_path_for(mmap_path);
 
+    tracing::info!(
+        actor = %actor,
+        mmap_path = %mmap_path.display(),
+        lock_path = %lock_path.display(),
+        "shared dataset mmap not ready; coordinating creation"
+    );
+
     for _ in 0..SHARED_DATASET_WAIT_RETRIES {
         if let Some(dataset) = try_open_mapped_dataset(mmap_path, leaf_size)? {
+            tracing::info!(
+                actor = %actor,
+                mmap_path = %mmap_path.display(),
+                "shared dataset mmap became available"
+            );
             return Ok(dataset);
         }
 
         if let Some(_lock) = try_acquire_init_lock(&lock_path)? {
+            tracing::info!(
+                actor = %actor,
+                mmap_path = %mmap_path.display(),
+                lock_path = %lock_path.display(),
+                "this process will create the shared dataset mmap file"
+            );
             build_shared_dataset_file(resources_dir, mmap_path, leaf_size)?;
 
             if let Some(dataset) = try_open_mapped_dataset(mmap_path, leaf_size)? {
+                tracing::info!(
+                    actor = %actor,
+                    mmap_path = %mmap_path.display(),
+                    "shared dataset mmap creation completed successfully"
+                );
                 return Ok(dataset);
             }
 
@@ -68,6 +98,18 @@ pub fn load_or_create_mapped_dataset(
                 mmap_path.display()
             )));
         }
+
+        let lock_owner = read_init_lock_owner(&lock_path)
+            .unwrap_or_else(|| "unknown actor".to_owned());
+
+        tracing::info!(
+            actor = %actor,
+            mmap_path = %mmap_path.display(),
+            lock_path = %lock_path.display(),
+            lock_owner,
+            wait_ms = SHARED_DATASET_WAIT_INTERVAL.as_millis(),
+            "shared dataset mmap init lock busy; waiting for creator to finish"
+        );
 
         thread::sleep(SHARED_DATASET_WAIT_INTERVAL);
     }
@@ -232,6 +274,14 @@ fn build_shared_dataset_file(
     mmap_path: &Path,
     leaf_size: usize,
 ) -> Result<(), FraudEngineError> {
+    tracing::info!(
+        actor = %current_actor(),
+        mmap_path = %mmap_path.display(),
+        resources_dir = %resources_dir.display(),
+        leaf_size,
+        "building shared dataset mmap file"
+    );
+
     if let Some(parent) = mmap_path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
             FraudEngineError::Load(format!(
@@ -260,6 +310,13 @@ fn build_shared_dataset_file(
             mmap_path.display()
         ))
     })?;
+
+    tracing::info!(
+        actor = %current_actor(),
+        mmap_path = %mmap_path.display(),
+        temp_path = %temp_path.display(),
+        "shared dataset mmap file published successfully"
+    );
 
     Ok(())
 }
@@ -405,14 +462,41 @@ fn lock_path_for(path: &Path) -> PathBuf {
 }
 
 fn try_acquire_init_lock(lock_path: &Path) -> Result<Option<InitLock>, FraudEngineError> {
+    let owner = current_actor();
+
     match OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(lock_path)
     {
-        Ok(_) => Ok(Some(InitLock {
-            path: lock_path.to_path_buf(),
-        })),
+        Ok(mut file) => {
+            file.write_all(owner.as_bytes()).map_err(|error| {
+                let _ = fs::remove_file(lock_path);
+                FraudEngineError::Load(format!(
+                    "failed to record shared dataset lock owner {}: {error}",
+                    lock_path.display()
+                ))
+            })?;
+
+            file.sync_all().map_err(|error| {
+                let _ = fs::remove_file(lock_path);
+                FraudEngineError::Load(format!(
+                    "failed to persist shared dataset lock owner {}: {error}",
+                    lock_path.display()
+                ))
+            })?;
+
+            tracing::info!(
+                actor = %owner,
+                lock_path = %lock_path.display(),
+                "shared dataset init lock acquired"
+            );
+
+            Ok(Some(InitLock {
+                path: lock_path.to_path_buf(),
+                owner,
+            }))
+        }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(None),
         Err(error) => Err(FraudEngineError::Load(format!(
             "failed to create shared dataset lock {}: {error}",
@@ -423,12 +507,45 @@ fn try_acquire_init_lock(lock_path: &Path) -> Result<Option<InitLock>, FraudEngi
 
 struct InitLock {
     path: PathBuf,
+    owner: String,
 }
 
 impl Drop for InitLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        match fs::remove_file(&self.path) {
+            Ok(()) => tracing::info!(
+                actor = %self.owner,
+                lock_path = %self.path.display(),
+                "shared dataset init lock released"
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => tracing::info!(
+                actor = %self.owner,
+                lock_path = %self.path.display(),
+                "shared dataset init lock already absent during release"
+            ),
+            Err(error) => tracing::warn!(
+                actor = %self.owner,
+                lock_path = %self.path.display(),
+                ?error,
+                "failed to release shared dataset init lock"
+            ),
+        }
     }
+}
+
+fn current_actor() -> String {
+    let pid = std::process::id();
+    let thread = thread::current();
+    let thread_name = thread.name().unwrap_or("unnamed");
+
+    format!("pid={pid} thread={thread_name}")
+}
+
+fn read_init_lock_owner(lock_path: &Path) -> Option<String> {
+    fs::read_to_string(lock_path)
+        .ok()
+        .map(|content| content.trim().to_owned())
+        .filter(|content| !content.is_empty())
 }
 
 #[cfg(test)]
