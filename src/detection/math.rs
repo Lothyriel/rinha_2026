@@ -28,30 +28,40 @@ pub fn bool_to_unit(value: bool) -> f32 {
     if value { 1.0 } else { 0.0 }
 }
 
-impl Vec16 {
+impl QuantizedVector {
     pub fn from_vector(vector: [f32; VECTOR_DIMENSIONS]) -> Self {
-        let mut padded = [0.0; PADDED_VECTOR_DIMENSIONS];
-        padded[..VECTOR_DIMENSIONS].copy_from_slice(&vector);
+        let mut padded = [0; STORED_VECTOR_DIMENSIONS];
+        for (index, value) in vector.iter().enumerate() {
+            padded[index] = quantize_value(*value);
+        }
         Self(padded)
     }
 
     pub fn from_query(vector: &[f32; VECTOR_DIMENSIONS]) -> Self {
-        let mut padded = [0.0; PADDED_VECTOR_DIMENSIONS];
-        padded[..VECTOR_DIMENSIONS].copy_from_slice(vector);
+        let mut padded = [0; STORED_VECTOR_DIMENSIONS];
+        for (index, value) in vector.iter().enumerate() {
+            padded[index] = quantize_value(*value);
+        }
         Self(padded)
     }
+}
+
+#[inline]
+fn quantize_value(value: f32) -> i16 {
+    let scaled = value.clamp(-1.0, 1.0) * QUANTIZATION_SCALE;
+    scaled.round() as i16
 }
 
 impl ExactKnnResult {
     pub fn new() -> Self {
         Self {
-            best_distances: [f32::INFINITY; K_NEIGHBORS],
-            best_indices: [VP_NONE; K_NEIGHBORS],
+            best_distances: [i64::MAX; K_NEIGHBORS],
+            best_indices: [u32::MAX; K_NEIGHBORS],
             found: 0,
         }
     }
 
-    pub fn insert(&mut self, idx: u32, distance: f32, neighbors: usize) {
+    pub fn insert(&mut self, idx: u32, distance: i64, neighbors: usize) {
         let insert_at = self
             .best_distances
             .partition_point(|current| *current < distance);
@@ -78,65 +88,89 @@ impl ExactKnnResult {
         );
     }
 
-    pub fn worst_distance(&self, neighbors: usize) -> f32 {
+    pub fn fraud_votes(&self, dataset: &DatasetStorage) -> usize {
+        self.best_indices[..self.found]
+            .iter()
+            .filter(|&&idx| idx != u32::MAX && dataset.label(idx as usize) == ReferenceLabel::Fraud)
+            .count()
+    }
+
+    pub fn worst_distance(&self, neighbors: usize) -> i64 {
         if self.found < neighbors {
-            f32::INFINITY
+            i64::MAX
         } else {
             self.best_distances[neighbors - 1]
         }
     }
-
-    pub fn fraud_votes(&self, dataset: &DatasetStorage) -> usize {
-        self.best_indices[..self.found]
-            .iter()
-            .filter(|&&idx| {
-                idx != VP_NONE
-                    && dataset.label(idx as usize) == ReferenceLabel::Fraud
-            })
-            .count()
-    }
 }
 
+#[cfg(test)]
 #[inline]
-pub fn l2_squared_scalar(left: &Vec16, right: &Vec16) -> f32 {
-    let mut total = 0.0f32;
+pub fn l2_squared_scalar(left: &QuantizedVector, right: &QuantizedVector) -> i64 {
+    let mut total = 0i64;
 
-    for index in 0..PADDED_VECTOR_DIMENSIONS {
-        let difference = left.0[index] - right.0[index];
-        total += difference * difference;
+    for index in 0..STORED_VECTOR_DIMENSIONS {
+        let difference = left.0[index] as i32 - right.0[index] as i32;
+        total += (difference * difference) as i64;
     }
 
     total
 }
 
 #[inline]
-#[target_feature(enable = "avx,fma")]
-pub unsafe fn l2_squared_avx(left: &Vec16, right: &Vec16) -> f32 {
-    let lp = left.0.as_ptr();
-    let rp = right.0.as_ptr();
+pub fn l2_squared_first_half_scalar(left: &QuantizedVector, right: &QuantizedVector) -> i64 {
+    let mut total = 0i64;
 
-    unsafe {
-        use std::arch::x86_64::*;
-        let d0 = _mm256_sub_ps(_mm256_load_ps(lp), _mm256_load_ps(rp));
-        let d1 = _mm256_sub_ps(_mm256_load_ps(lp.add(8)), _mm256_load_ps(rp.add(8)));
-        let acc = _mm256_fmadd_ps(d0, d0, _mm256_mul_ps(d1, d1));
-        horizontal_sum_m256(acc)
+    for index in 0..8 {
+        let difference = left.0[index] as i32 - right.0[index] as i32;
+        total += (difference * difference) as i64;
     }
+
+    total
 }
 
 #[inline]
-#[target_feature(enable = "avx")]
-unsafe fn horizontal_sum_m256(value: std::arch::x86_64::__m256) -> f32 {
+pub fn l2_squared_second_half_scalar(left: &QuantizedVector, right: &QuantizedVector) -> i64 {
+    let mut total = 0i64;
+
+    for index in 8..STORED_VECTOR_DIMENSIONS {
+        let difference = left.0[index] as i32 - right.0[index] as i32;
+        total += (difference * difference) as i64;
+    }
+
+    total
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "sse2")]
+pub unsafe fn l2_squared_first_half_x86(left: &QuantizedVector, right: &QuantizedVector) -> i64 {
     use std::arch::x86_64::*;
 
-    let lo = _mm256_castps256_ps128(value);
-    let hi = _mm256_extractf128_ps(value, 1);
+    let left_half = unsafe { _mm_loadu_si128(left.0.as_ptr().cast::<__m128i>()) };
+    let right_half = unsafe { _mm_loadu_si128(right.0.as_ptr().cast::<__m128i>()) };
+    let diff = _mm_sub_epi16(left_half, right_half);
+    let pair_sums = _mm_madd_epi16(diff, diff);
+    let mut lanes = [0i32; 4];
+    unsafe {
+        _mm_storeu_si128(lanes.as_mut_ptr().cast::<__m128i>(), pair_sums);
+    }
+    lanes.into_iter().map(i64::from).sum()
+}
 
-    let sum = _mm_add_ps(lo, hi);
-    let shuf = _mm_shuffle_ps(sum, sum, 0b_10_11_00_01);
-    let sums = _mm_add_ps(sum, shuf);
-    let shuf = _mm_movehl_ps(shuf, sums);
-    let sums = _mm_add_ss(sums, shuf);
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "sse2")]
+pub unsafe fn l2_squared_second_half_x86(left: &QuantizedVector, right: &QuantizedVector) -> i64 {
+    use std::arch::x86_64::*;
 
-    _mm_cvtss_f32(sums)
+    let left_half = unsafe { _mm_loadu_si128(left.0.as_ptr().add(8).cast::<__m128i>()) };
+    let right_half = unsafe { _mm_loadu_si128(right.0.as_ptr().add(8).cast::<__m128i>()) };
+    let diff = _mm_sub_epi16(left_half, right_half);
+    let pair_sums = _mm_madd_epi16(diff, diff);
+    let mut lanes = [0i32; 4];
+    unsafe {
+        _mm_storeu_si128(lanes.as_mut_ptr().cast::<__m128i>(), pair_sums);
+    }
+    lanes.into_iter().map(i64::from).sum()
 }

@@ -15,258 +15,81 @@ impl FraudEngine {
     }
 }
 
-pub fn build_index(references: &[StoredReference], leaf_size: usize) -> ExactSearchIndex {
-    let mut nodes = Vec::new();
-    let mut indices = Vec::with_capacity(references.len());
-    let mut point_indices = (0..references.len() as u32).collect::<Vec<_>>();
-
-    if !point_indices.is_empty() {
-        build_vp_node(
-            references,
-            &mut point_indices,
-            &mut nodes,
-            &mut indices,
-            1,
-            leaf_size,
-        );
-    }
-
-    ExactSearchIndex { nodes, indices }
-}
-
-fn build_vp_node(
-    references: &[StoredReference],
-    point_indices: &mut [u32],
-    nodes: &mut Vec<VpNode>,
-    leaf_indices: &mut Vec<u32>,
-    depth: usize,
-    leaf_size: usize,
-) -> u32 {
-    let node_idx = nodes.len() as u32;
-    nodes.push(VpNode {
-        pivot_idx: VP_NONE,
-        radius: 0.0,
-        left: VP_NONE,
-        right: VP_NONE,
-        start: 0,
-        len: 0,
-    });
-
-    if point_indices.len() <= leaf_size || depth >= EXACT_STACK_CAPACITY {
-        finalize_leaf_node(nodes, node_idx, point_indices, leaf_indices);
-        return node_idx;
-    }
-
-    let pivot_position = choose_pivot_position(references, point_indices);
-    point_indices.swap(pivot_position, point_indices.len() - 1);
-
-    let pivot_idx = point_indices[point_indices.len() - 1];
-    let pivot = &references[pivot_idx as usize].padded_vector;
-    let candidate_len = point_indices.len() - 1;
-    let candidates = &mut point_indices[..candidate_len];
-
-    if candidates.is_empty() {
-        finalize_leaf_node(nodes, node_idx, point_indices, leaf_indices);
-        return node_idx;
-    }
-
-    let mut distances = candidates
-        .iter()
-        .map(|&idx| PointDistance {
-            idx,
-            dist: math::l2_squared_scalar(pivot, &references[idx as usize].padded_vector),
-        })
-        .collect::<Vec<_>>();
-
-    let median_position = distances.len() / 2;
-    distances.select_nth_unstable_by(median_position, |left, right| {
-        left.dist.total_cmp(&right.dist)
-    });
-
-    let radius = distances[median_position].dist;
-    let mut left_count = 0usize;
-
-    for point in &distances {
-        if point.dist <= radius {
-            candidates[left_count] = point.idx;
-            left_count += 1;
-        }
-    }
-
-    if left_count == 0 || left_count == distances.len() {
-        finalize_leaf_node(nodes, node_idx, point_indices, leaf_indices);
-        return node_idx;
-    }
-
-    let mut write_pos = left_count;
-
-    for point in &distances {
-        if point.dist > radius {
-            candidates[write_pos] = point.idx;
-            write_pos += 1;
-        }
-    }
-
-    let (left_slice, right_slice) = candidates.split_at_mut(left_count);
-    let left = build_vp_node(references, left_slice, nodes, leaf_indices, depth + 1, leaf_size);
-    let right = build_vp_node(references, right_slice, nodes, leaf_indices, depth + 1, leaf_size);
-
-    nodes[node_idx as usize] = VpNode {
-        pivot_idx,
-        radius,
-        left,
-        right,
-        start: 0,
-        len: 0,
-    };
-
-    node_idx
-}
-
-fn finalize_leaf_node(
-    nodes: &mut [VpNode],
-    node_idx: u32,
-    point_indices: &[u32],
-    leaf_indices: &mut Vec<u32>,
-) {
-    let start = leaf_indices.len() as u32;
-    leaf_indices.extend_from_slice(point_indices);
-    nodes[node_idx as usize] = VpNode {
-        pivot_idx: VP_NONE,
-        radius: 0.0,
-        left: VP_NONE,
-        right: VP_NONE,
-        start,
-        len: point_indices.len() as u32,
-    };
-}
-
-fn choose_pivot_position(references: &[StoredReference], point_indices: &[u32]) -> usize {
-    let sample_len = point_indices.len().min(PIVOT_SAMPLE_SIZE);
-
-    if sample_len <= 1 {
-        return 0;
-    }
-
-    let step = point_indices.len().div_ceil(sample_len);
-    let mut sampled_positions = [0usize; PIVOT_SAMPLE_SIZE];
-
-    for (index, position) in sampled_positions.iter_mut().take(sample_len).enumerate() {
-        *position = (index * step).min(point_indices.len() - 1);
-    }
-
-    let mut best_position = sampled_positions[0];
-    let mut best_mean_distance = f32::NEG_INFINITY;
-
-    for &candidate_position in sampled_positions.iter().take(sample_len) {
-        let candidate = &references[point_indices[candidate_position] as usize].padded_vector;
-        let mut total_distance = 0.0f32;
-
-        for &comparison_position in sampled_positions.iter().take(sample_len) {
-            if comparison_position == candidate_position {
-                continue;
-            }
-
-            total_distance += math::l2_squared_scalar(
-                candidate,
-                &references[point_indices[comparison_position] as usize].padded_vector,
-            );
-        }
-
-        let mean_distance = total_distance / (sample_len.saturating_sub(1) as f32);
-
-        if mean_distance > best_mean_distance {
-            best_mean_distance = mean_distance;
-            best_position = candidate_position;
-        }
-    }
-
-    best_position
-}
-
 pub fn search_exact_knn(
     dataset: &DatasetStorage,
     query: &[f32; VECTOR_DIMENSIONS],
     neighbors: usize,
 ) -> ExactKnnResult {
-    let query = Vec16::from_query(query);
+    let query = QuantizedVector::from_query(query);
 
-    search_exact_knn_with_distance(dataset, &query, neighbors, |left, right| unsafe {
-        math::l2_squared_avx(left, right)
-    })
-}
-
-fn search_exact_knn_with_distance(
-    dataset: &DatasetStorage,
-    query: &Vec16,
-    neighbors: usize,
-    distance_fn: impl Fn(&Vec16, &Vec16) -> f32,
-) -> ExactKnnResult {
-    let mut result = ExactKnnResult::new();
-    let nodes = dataset.nodes();
-
-    if nodes.is_empty() || neighbors == 0 {
-        return result;
+    if neighbors == 0 || dataset.len() == 0 {
+        return ExactKnnResult::new();
     }
 
-    let mut stack = [VP_NONE; EXACT_STACK_CAPACITY];
-    let mut stack_len = 1usize;
-    stack[0] = 0;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { search_exact_knn_avx2(dataset, &query, neighbors) };
+        }
+    }
 
-    while stack_len > 0 {
-        stack_len -= 1;
-        let node = &nodes[stack[stack_len] as usize];
+    search_exact_knn_scalar(dataset, &query, neighbors)
+}
 
-        if node.len > 0 {
-            let leaf_start = node.start as usize;
-            let leaf_end = leaf_start + node.len as usize;
+fn search_exact_knn_scalar(
+    dataset: &DatasetStorage,
+    query: &QuantizedVector,
+    neighbors: usize,
+) -> ExactKnnResult {
+    let mut result = ExactKnnResult::new();
 
-            for &reference_idx in &dataset.indices()[leaf_start..leaf_end] {
-                let distance = distance_fn(query, dataset.vector(reference_idx as usize));
-                result.insert(reference_idx, distance, neighbors);
-            }
+    for index in 0..dataset.len() {
+        let candidate = dataset.vector(index);
+        let first_half = math::l2_squared_first_half_scalar(query, candidate);
 
+        if first_half > result.worst_distance(neighbors) {
             continue;
         }
 
-        let pivot_idx = node.pivot_idx as usize;
-        let pivot_distance = distance_fn(query, dataset.vector(pivot_idx));
-        result.insert(node.pivot_idx, pivot_distance, neighbors);
-
-        let (near, far) = if pivot_distance <= node.radius {
-            (node.left, node.right)
-        } else {
-            (node.right, node.left)
-        };
-
-        let can_visit_far = if far == VP_NONE {
-            false
-        } else if result.found < neighbors {
-            true
-        } else {
-            let worst_distance = result.worst_distance(neighbors);
-            (pivot_distance.sqrt() - node.radius.sqrt()).abs() <= worst_distance.sqrt() + EPSILON
-        };
-
-        if can_visit_far {
-            push_stack(&mut stack, &mut stack_len, far);
-        }
-
-        if near != VP_NONE {
-            push_stack(&mut stack, &mut stack_len, near);
-        }
+        let distance = first_half + math::l2_squared_second_half_scalar(query, candidate);
+        result.insert(index as u32, distance, neighbors);
     }
 
     result
 }
 
-fn push_stack(stack: &mut [u32; EXACT_STACK_CAPACITY], stack_len: &mut usize, value: u32) {
-    assert!(
-        *stack_len < EXACT_STACK_CAPACITY,
-        "vp-tree traversal stack exceeded capacity"
-    );
-    stack[*stack_len] = value;
-    *stack_len += 1;
+#[cfg(target_arch = "x86_64")]
+unsafe fn search_exact_knn_avx2(
+    dataset: &DatasetStorage,
+    query: &QuantizedVector,
+    neighbors: usize,
+) -> ExactKnnResult {
+    use std::arch::x86_64::_MM_HINT_T0;
+
+    let mut result = ExactKnnResult::new();
+
+    for index in 0..dataset.len() {
+        if index + 8 < dataset.len() {
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(
+                    dataset.vector(index + 8).0.as_ptr().cast::<i8>(),
+                    _MM_HINT_T0,
+                );
+            }
+        }
+
+        let candidate = dataset.vector(index);
+        let first_half = unsafe { math::l2_squared_first_half_x86(query, candidate) };
+
+        if first_half > result.worst_distance(neighbors) {
+            continue;
+        }
+
+        let distance = first_half + unsafe { math::l2_squared_second_half_x86(query, candidate) };
+        result.insert(index as u32, distance, neighbors);
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -277,7 +100,7 @@ mod tests {
 
     fn test_reference(vector: [f32; VECTOR_DIMENSIONS], is_fraud: bool) -> StoredReference {
         StoredReference {
-            padded_vector: Vec16::from_vector(vector),
+            quantized_vector: QuantizedVector::from_vector(vector),
             label: if is_fraud {
                 ReferenceLabel::Fraud
             } else {
@@ -291,7 +114,7 @@ mod tests {
         query: &[f32; VECTOR_DIMENSIONS],
         neighbors: usize,
     ) -> ExactKnnResult {
-        let query = Vec16::from_query(query);
+        let query = QuantizedVector::from_query(query);
         let mut result = ExactKnnResult::new();
 
         for index in 0..dataset.len() {
@@ -306,7 +129,14 @@ mod tests {
     }
 
     fn synthetic_engine(references: Vec<StoredReference>) -> FraudEngine {
-        let index = build_index(&references, LEAF_SIZE);
+        let vectors = references
+            .iter()
+            .map(|reference| reference.quantized_vector)
+            .collect();
+        let labels = references
+            .iter()
+            .map(|reference| reference.label.to_storage_byte())
+            .collect();
 
         FraudEngine {
             normalization: NormalizationConfig {
@@ -319,7 +149,7 @@ mod tests {
                 max_merchant_avg_amount: 1.0,
             },
             mcc_risk: HashMap::new(),
-            dataset: DatasetStorage::Owned(OwnedDataset { references, index }),
+            dataset: DatasetStorage::Owned(OwnedDataset { vectors, labels }),
         }
     }
 
@@ -358,7 +188,7 @@ mod tests {
     }
 
     #[test]
-    fn vp_tree_exact_search_matches_bruteforce_knn() {
+    fn exact_search_matches_bruteforce_knn() {
         let references = (0..96u32)
             .map(|value| {
                 let vector = std::array::from_fn(|dimension| {
@@ -389,19 +219,12 @@ mod tests {
 
             assert_eq!(exact.found, brute_force.found);
             assert_eq!(exact.best_indices, brute_force.best_indices);
-
-            for (left, right) in exact
-                .best_distances
-                .iter()
-                .zip(brute_force.best_distances.iter())
-            {
-                assert!((left - right).abs() < 0.0001);
-            }
+            assert_eq!(exact.best_distances, brute_force.best_distances);
         }
     }
 
     #[test]
-    fn vp_tree_handles_identical_vectors_without_degenerate_recursion() {
+    fn exact_search_handles_identical_vectors() {
         let references = (0..48u32)
             .map(|value| test_reference([0.25; VECTOR_DIMENSIONS], value % 2 == 0))
             .collect::<Vec<_>>();
@@ -411,17 +234,15 @@ mod tests {
         let exact = search_exact_knn(&engine.dataset, &query, K_NEIGHBORS);
 
         assert_eq!(exact.found, K_NEIGHBORS);
-        assert_eq!(engine.dataset.nodes().len(), 1);
-        assert_eq!(engine.dataset.nodes()[0].len, 48);
         assert!(
             exact.best_distances[..exact.found]
                 .iter()
-                .all(|distance| *distance == 0.0)
+                .all(|distance| *distance == 0)
         );
     }
 
     #[test]
-    fn vp_tree_exact_search_matches_bruteforce_across_large_random_dataset() {
+    fn exact_search_matches_bruteforce_across_large_random_dataset() {
         let engine = synthetic_engine(generate_random_dataset(4_096, 0x5eed_f00d_dead_beef));
         let mut query_state = 0x1234_5678_9abc_def0;
 
@@ -432,14 +253,7 @@ mod tests {
 
             assert_eq!(exact.found, brute_force.found);
             assert_eq!(exact.best_indices, brute_force.best_indices);
-
-            for (left, right) in exact
-                .best_distances
-                .iter()
-                .zip(brute_force.best_distances.iter())
-            {
-                assert!((left - right).abs() < 0.0001);
-            }
+            assert_eq!(exact.best_distances, brute_force.best_distances);
         }
     }
 }

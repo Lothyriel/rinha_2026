@@ -6,8 +6,9 @@ Implementação inicial em Rust para a Rinha de Backend 2026.
 
 - API com `GET /ready` e `POST /fraud-score`
 - Vetorização 14D conforme a spec
-- Busca KNN exata com VP-tree flattenizada + distância euclidiana quadrática
-- Carregamento do dataset oficial via `resources/references.json.gz`
+- Busca KNN sobre vetores quantizados `i16`, usando apenas dataset reduzido por K-means embutido no binário
+- Parsing/serialização JSON via `sonic-rs`
+- Servidor HTTP/1.1 manual com keep-alive atrás do nginx em socket Unix
 - `docker-compose.yml` com nginx + 2 instâncias da API
 
 ## Rodando localmente
@@ -26,13 +27,44 @@ RINHA_UNIX_SOCKET_PATH=/tmp/rinha-api.sock cargo run
 
 Quando `RINHA_UNIX_SOCKET_PATH` está definido, a API passa a escutar apenas no socket informado. Quando não está definido, o comportamento padrão continua sendo TCP na porta `9999`.
 
-Para compartilhar o dataset/index entre processos via arquivo `mmap`:
+Antes de rodar ou compilar a API, gere o artefato versionável `spec/resources/index.mmap` com centroides/medoids por K-means:
 
 ```bash
-RINHA_SHARED_MMAP_PATH=/tmp/rinha-shared-dataset.bin cargo run
+cargo run --release --bin prebuild_shared_dataset spec/resources spec/resources/index.mmap 2048
 ```
 
-O primeiro processo cria o arquivo mapeado e os próximos apenas o reutilizam em modo leitura.
+Ou via script do repositório, já escrevendo o artefato versionável em `spec/resources/index.mmap`:
+
+```bash
+./scripts/generate-centroid-mmap.sh
+```
+
+Com parâmetros explícitos:
+
+```bash
+RINHA_KMEANS_K=2048 RINHA_KMEANS_SEED=67 ./scripts/generate-centroid-mmap.sh spec/resources spec/resources/index.mmap
+```
+
+Esse arquivo `spec/resources/index.mmap` deve ser adicionado ao repositório via Git LFS. O build agora usa `include_bytes!`, então compilar a API falha se esse artefato não existir.
+
+Para rodar a API localmente depois disso:
+
+```bash
+cargo run --release
+```
+
+Para controlar a geração dos centroides:
+
+```bash
+RINHA_KMEANS_K=2048 cargo run --release --bin prebuild_shared_dataset -- spec/resources spec/resources/index.mmap 2048
+RINHA_KMEANS_SEED=67 ./scripts/generate-centroid-mmap.sh
+```
+
+O artefato embutido contém:
+
+- cabeçalho com versão/layout da quantização
+- vetores `[i16; 16]` alinhados
+- labels em bloco separado
 
 ## Testes
 
@@ -51,6 +83,8 @@ cargo run --release --example fraud_score_bench
 
 O benchmark usa payloads reais extraídos da spec e mede throughput do `engine.score()`.
 
+O benchmark mede throughput usando o dataset centroid-reduzido embutido no binário.
+
 ## Docker Compose
 
 Quando houver Docker disponível no host:
@@ -63,8 +97,8 @@ Observações:
 
 - load balancer expõe a porta `9999`
 - compose fixa `platform: linux/amd64`
-- backend padrão no compose é `exact`, para manter aderência à spec
-- o backend experimental pode ser testado alterando `RINHA_SEARCH_BACKEND`
+- nginx reutiliza conexões HTTP/1.1 upstream sobre socket Unix
+- as duas instâncias usam o mesmo artefato centroid-reduzido versionado no repositório
 
 ## Publicação de imagem
 
@@ -90,6 +124,7 @@ Por padrão a aplicação lê:
 - `resources/references.json.gz`
 - `resources/mcc_risk.json`
 - `resources/normalization.json`
+- `resources/index.mmap` embutido no binário em tempo de compilação
 
 Você pode sobrescrever o diretório com:
 

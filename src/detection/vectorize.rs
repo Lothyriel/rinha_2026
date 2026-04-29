@@ -1,5 +1,3 @@
-use chrono::{DateTime, Datelike, Timelike, Utc};
-
 use crate::model::FraudScoreRequest;
 
 use super::*;
@@ -25,8 +23,8 @@ impl FraudEngine {
             self.normalization.amount_vs_avg_ratio,
         );
 
-        let hour_of_day = requested_at.hour() as f32 / 23.0;
-        let day_of_week = requested_at.weekday().num_days_from_monday() as f32 / 6.0;
+        let hour_of_day = requested_at.hour as f32 / 23.0;
+        let day_of_week = requested_at.weekday_monday0 as f32 / 6.0;
 
         let (minutes_since_last_tx, km_from_last_tx) = self.get_last_tx_data(req, requested_at)?;
 
@@ -79,18 +77,15 @@ impl FraudEngine {
     fn get_last_tx_data(
         &self,
         req: &FraudScoreRequest,
-        requested_at: DateTime<Utc>,
+        requested_at: loader::ParsedTimestamp,
     ) -> Result<(f32, f32), FraudEngineError> {
         let Some(last_transaction) = &req.last_transaction else {
             return Ok((-1.0, -1.0));
         };
 
         let last_timestamp = loader::parse_utc_timestamp(&last_transaction.timestamp)?;
-
-        let elapsed_seconds = requested_at
-            .signed_duration_since(last_timestamp)
-            .num_seconds()
-            .max(0) as f32;
+        let elapsed_seconds =
+            (requested_at.unix_seconds - last_timestamp.unix_seconds).max(0) as f32;
 
         let time = math::clamp_ratio(elapsed_seconds / 60.0, self.normalization.max_minutes);
 
