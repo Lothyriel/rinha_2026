@@ -2,8 +2,7 @@ use super::*;
 
 const MAX_KMEANS_SAMPLE: usize = 50_000;
 const MAX_KMEANS_ITERATIONS: usize = 25;
-
-
+const STACK_CLUSTER_ORDER_CAPACITY: usize = 4_096;
 
 #[derive(Debug)]
 struct KMeansModel {
@@ -24,10 +23,9 @@ impl FraudEngine {
         query: &[f32; VECTOR_DIMENSIONS],
         neighbors: usize,
     ) -> (usize, usize) {
-        search_exact_knn(&self.dataset, query, neighbors)
+        search_exact_knn(&self.dataset, self.search, query, neighbors)
     }
 }
-
 
 pub fn build_ivf_index(references: &[StoredReference]) -> Result<IvfIndex, FraudEngineError> {
     if references.is_empty() {
@@ -125,6 +123,7 @@ pub fn build_ivf_index(references: &[StoredReference]) -> Result<IvfIndex, Fraud
 
 fn search_exact_knn(
     dataset: &OwnedDataset,
+    search: SearchConfig,
     query: &[f32; VECTOR_DIMENSIONS],
     neighbors: usize,
 ) -> (usize, usize) {
@@ -136,29 +135,89 @@ fn search_exact_knn(
     let quantized_query: [i16; VECTOR_DIMENSIONS] =
         std::array::from_fn(|dimension| math::quantize(query[dimension]));
     let query_quantized_f32 = quantized_query.map(|value| value as f32);
-    let mut cluster_order = (0..dataset.cluster_count())
-        .map(|cluster| {
-            (
-                cluster,
-                centroid_distance_squared(dataset, &query_quantized_f32, cluster),
-            )
-        })
-        .collect::<Vec<_>>();
-    cluster_order.sort_unstable_by(|left, right| left.1.total_cmp(&right.1));
+    let cluster_count = dataset.cluster_count();
+    let nprobe = effective_nprobe(search, cluster_count);
 
-    for (cluster, centroid_distance_sq) in cluster_order {
-        if result.found >= neighbors {
-            let lower_bound = centroid_distance_sq.sqrt() - dataset.radius(cluster);
-            let bounded = lower_bound.max(0.0);
-            if bounded * bounded > result.worst_distance(neighbors) as f32 {
-                continue;
-            }
+    if cluster_count <= STACK_CLUSTER_ORDER_CAPACITY {
+        let mut cluster_distances = [0.0f32; STACK_CLUSTER_ORDER_CAPACITY];
+        let mut cluster_order = [0u16; STACK_CLUSTER_ORDER_CAPACITY];
+
+        for cluster in 0..cluster_count {
+            cluster_distances[cluster] =
+                centroid_distance_squared(dataset, &query_quantized_f32, cluster);
+            cluster_order[cluster] = cluster as u16;
         }
 
-        scan_cluster(dataset, &quantized_query, cluster, neighbors, &mut result);
+        cluster_order[..cluster_count].sort_unstable_by(|&left, &right| {
+            cluster_distances[left as usize].total_cmp(&cluster_distances[right as usize])
+        });
+
+        for &cluster in &cluster_order[..nprobe] {
+            scan_cluster_if_needed(
+                dataset,
+                &quantized_query,
+                cluster as usize,
+                cluster_distances[cluster as usize],
+                neighbors,
+                &mut result,
+            );
+        }
+    } else {
+        let mut cluster_distances = Vec::with_capacity(cluster_count);
+        let mut cluster_order = Vec::with_capacity(cluster_count);
+
+        for cluster in 0..cluster_count {
+            cluster_distances.push(centroid_distance_squared(
+                dataset,
+                &query_quantized_f32,
+                cluster,
+            ));
+            cluster_order.push(cluster);
+        }
+
+        cluster_order.sort_unstable_by(|&left, &right| {
+            cluster_distances[left].total_cmp(&cluster_distances[right])
+        });
+
+        for cluster in cluster_order.into_iter().take(nprobe) {
+            scan_cluster_if_needed(
+                dataset,
+                &quantized_query,
+                cluster,
+                cluster_distances[cluster],
+                neighbors,
+                &mut result,
+            );
+        }
     }
 
     result.finalize(neighbors)
+}
+
+#[inline]
+fn effective_nprobe(search: SearchConfig, cluster_count: usize) -> usize {
+    search.nprobe.unwrap_or(32).min(cluster_count).max(1)
+}
+
+#[inline]
+fn scan_cluster_if_needed(
+    dataset: &OwnedDataset,
+    quantized_query: &[i16; VECTOR_DIMENSIONS],
+    cluster: usize,
+    centroid_distance_sq: f32,
+    neighbors: usize,
+    result: &mut topk::SortedTopK,
+) {
+    if result.found >= neighbors {
+        let radius = dataset.radius(cluster);
+        let lower_bound =
+            centroid_distance_sq - 2.0 * radius * centroid_distance_sq.sqrt() + radius * radius;
+        if lower_bound.max(0.0) > result.worst_distance(neighbors) as f32 {
+            return;
+        }
+    }
+
+    scan_cluster(dataset, quantized_query, cluster, neighbors, result);
 }
 
 fn scan_cluster(
@@ -177,6 +236,12 @@ fn scan_cluster(
     for block_index in block_start..block_end {
         let block_base = block_index * VECTOR_DIMENSIONS * BLOCK_WIDTH;
         let label_base = block_index * BLOCK_WIDTH;
+        let block = &quantized_blocks[block_base..block_base + VECTOR_DIMENSIONS * BLOCK_WIDTH];
+        let distances = simd::distance_squared_block_with_threshold(
+            query,
+            block,
+            result.worst_distance(neighbors),
+        );
 
         for lane in 0..BLOCK_WIDTH {
             let label = labels[label_base + lane];
@@ -184,20 +249,8 @@ fn scan_cluster(
                 continue;
             }
 
-            // Use SIMD distance computation with early-exit threshold
-            // This skips remaining dimensions if partial distance already exceeds worst found
-            let mut reference = [0i16; VECTOR_DIMENSIONS];
-            for dimension in 0..VECTOR_DIMENSIONS {
-                reference[dimension] = quantized_blocks[block_base + dimension * BLOCK_WIDTH + lane];
-            }
-            
-            // Get current worst distance threshold for early-exit
-            let threshold = result.worst_distance(neighbors);
-            
-            // Compute distance with threshold-based early exit
-            let distance = simd::distance_squared_with_threshold(query, &reference, threshold);
-
             // Only insert if distance is below threshold (i32::MAX indicates early exit)
+            let distance = distances[lane];
             if distance != i32::MAX {
                 result.insert(distance, label, neighbors);
             }
@@ -506,6 +559,7 @@ mod tests {
             },
             mcc_risk: HashMap::new(),
             dataset: OwnedDataset { index },
+            search: SearchConfig { nprobe: None },
         }
     }
 
@@ -565,7 +619,7 @@ mod tests {
         ];
 
         for query in queries {
-            let exact = search_exact_knn(&engine.dataset, &query, K_NEIGHBORS);
+            let exact = search_exact_knn(&engine.dataset, engine.search, &query, K_NEIGHBORS);
             let brute_force = brute_force_knn(&references, &query, K_NEIGHBORS);
 
             assert_eq!(exact.0, brute_force.0);
@@ -581,11 +635,21 @@ mod tests {
 
         for _ in 0..32 {
             let query = random_query(&mut query_state);
-            let exact = search_exact_knn(&engine.dataset, &query, K_NEIGHBORS);
+            let exact = search_exact_knn(&engine.dataset, engine.search, &query, K_NEIGHBORS);
             let brute_force = brute_force_knn(&references, &query, K_NEIGHBORS);
 
             assert_eq!(exact.0, brute_force.0);
             assert_eq!(exact.1, brute_force.1);
         }
+    }
+
+    #[test]
+    fn effective_nprobe_defaults_to_full_scan() {
+        assert_eq!(effective_nprobe(SearchConfig { nprobe: None }, 64), 64);
+    }
+
+    #[test]
+    fn effective_nprobe_is_clamped_to_cluster_count() {
+        assert_eq!(effective_nprobe(SearchConfig { nprobe: Some(128) }, 64), 64);
     }
 }

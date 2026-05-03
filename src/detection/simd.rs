@@ -11,16 +11,17 @@
 
 use super::*;
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 /// Compute squared Euclidean distance for first 8 dimensions using SSE MADD.
 ///
 /// # Safety
 /// Requires AVX2 support. Caller must verify at runtime or compile-time.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 #[inline]
-fn distance_squared_first_8_dims(
+unsafe fn distance_squared_first_8_dims_avx2(
     query: &[i16; VECTOR_DIMENSIONS],
     reference: &[i16; VECTOR_DIMENSIONS],
 ) -> i32 {
@@ -55,13 +56,14 @@ fn distance_squared_first_8_dims(
 /// - Handles 14D vectors with scale 10000
 /// - Max accumulation: 14 × (10000)² = 1.4×10⁹ < i32::MAX
 /// - Exact match to scalar implementation
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 #[inline]
-pub fn distance_squared_avx2(
+pub unsafe fn distance_squared_avx2(
     query: &[i16; VECTOR_DIMENSIONS],
     reference: &[i16; VECTOR_DIMENSIONS],
 ) -> i32 {
-    let mut distance = distance_squared_first_8_dims(query, reference);
+    let mut distance = unsafe { distance_squared_first_8_dims_avx2(query, reference) };
 
     // Process remaining 6 dimensions (indices 8-13) with scalar loop
     for dimension in 8..VECTOR_DIMENSIONS {
@@ -79,15 +81,16 @@ pub fn distance_squared_avx2(
 ///
 /// # Safety
 /// Requires AVX2 support. Caller must verify at runtime or compile-time.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 #[inline]
-pub fn distance_squared_with_threshold_avx2(
+pub unsafe fn distance_squared_with_threshold_avx2(
     query: &[i16; VECTOR_DIMENSIONS],
     reference: &[i16; VECTOR_DIMENSIONS],
     threshold: i32,
 ) -> i32 {
     // Compute first 8 dimensions
-    let partial = distance_squared_first_8_dims(query, reference);
+    let partial = unsafe { distance_squared_first_8_dims_avx2(query, reference) };
 
     // Early exit if partial distance already exceeds threshold
     if partial > threshold {
@@ -143,21 +146,84 @@ pub fn distance_squared_with_threshold_scalar(
     distance
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+pub unsafe fn distance_squared_block_with_threshold_avx2(
+    query: &[i16; VECTOR_DIMENSIONS],
+    block: &[i16],
+    threshold: i32,
+) -> [i32; BLOCK_WIDTH] {
+    debug_assert_eq!(block.len(), VECTOR_DIMENSIONS * BLOCK_WIDTH);
+
+    unsafe {
+        let mut acc = _mm256_setzero_si256();
+
+        for (dimension, &query_value) in query.iter().enumerate() {
+            let row_offset = dimension * BLOCK_WIDTH;
+            let references_i16 =
+                _mm_loadu_si128(block[row_offset..].as_ptr() as *const __m128i);
+            let references = _mm256_cvtepi16_epi32(references_i16);
+            let query_lane = _mm256_set1_epi32(query_value as i32);
+            let delta = _mm256_sub_epi32(query_lane, references);
+            let squared = _mm256_mullo_epi32(delta, delta);
+            acc = _mm256_add_epi32(acc, squared);
+        }
+
+        let mut distances = [0i32; BLOCK_WIDTH];
+        _mm256_storeu_si256(distances.as_mut_ptr() as *mut __m256i, acc);
+
+        if threshold != i32::MAX {
+            for distance in &mut distances {
+                if *distance > threshold {
+                    *distance = i32::MAX;
+                }
+            }
+        }
+
+        distances
+    }
+}
+
+#[inline]
+pub fn distance_squared_block_with_threshold_scalar(
+    query: &[i16; VECTOR_DIMENSIONS],
+    block: &[i16],
+    threshold: i32,
+) -> [i32; BLOCK_WIDTH] {
+    debug_assert_eq!(block.len(), VECTOR_DIMENSIONS * BLOCK_WIDTH);
+
+    let mut distances = [0i32; BLOCK_WIDTH];
+    for (lane, distance) in distances.iter_mut().enumerate() {
+        let mut total = 0i32;
+        for (dimension, &query_value) in query.iter().enumerate() {
+            let delta = query_value as i32 - block[dimension * BLOCK_WIDTH + lane] as i32;
+            total = total.wrapping_add(delta * delta);
+            if total > threshold {
+                total = i32::MAX;
+                break;
+            }
+        }
+        *distance = total;
+    }
+
+    distances
+}
+
 /// Select the appropriate distance function based on CPU capabilities.
 #[inline]
 pub fn distance_squared(
     query: &[i16; VECTOR_DIMENSIONS],
     reference: &[i16; VECTOR_DIMENSIONS],
 ) -> i32 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(target_arch = "x86_64")]
     {
-        distance_squared_avx2(query, reference)
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { distance_squared_avx2(query, reference) };
+        }
     }
 
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-    {
-        distance_squared_scalar(query, reference)
-    }
+    distance_squared_scalar(query, reference)
 }
 
 /// Select the appropriate distance function with threshold based on CPU capabilities.
@@ -167,15 +233,30 @@ pub fn distance_squared_with_threshold(
     reference: &[i16; VECTOR_DIMENSIONS],
     threshold: i32,
 ) -> i32 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(target_arch = "x86_64")]
     {
-        distance_squared_with_threshold_avx2(query, reference, threshold)
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { distance_squared_with_threshold_avx2(query, reference, threshold) };
+        }
     }
 
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    distance_squared_with_threshold_scalar(query, reference, threshold)
+}
+
+#[inline]
+pub fn distance_squared_block_with_threshold(
+    query: &[i16; VECTOR_DIMENSIONS],
+    block: &[i16],
+    threshold: i32,
+) -> [i32; BLOCK_WIDTH] {
+    #[cfg(target_arch = "x86_64")]
     {
-        distance_squared_with_threshold_scalar(query, reference, threshold)
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { distance_squared_block_with_threshold_avx2(query, block, threshold) };
+        }
     }
+
+    distance_squared_block_with_threshold_scalar(query, block, threshold)
 }
 
 #[cfg(test)]
@@ -193,13 +274,15 @@ mod tests {
 
         let scalar_result = distance_squared_scalar(&query, &reference);
 
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        #[cfg(target_arch = "x86_64")]
         {
-            let avx2_result = distance_squared_avx2(&query, &reference);
-            assert_eq!(
-                scalar_result, avx2_result,
-                "AVX2 and scalar results must match exactly"
-            );
+            if std::arch::is_x86_feature_detected!("avx2") {
+                let avx2_result = unsafe { distance_squared_avx2(&query, &reference) };
+                assert_eq!(
+                    scalar_result, avx2_result,
+                    "AVX2 and scalar results must match exactly"
+                );
+            }
         }
 
         // Verify correctness: (150-100)² + (250-200)² + ... = 50² × 14 = 35000
@@ -213,10 +296,12 @@ mod tests {
         let result = distance_squared_scalar(&vector, &vector);
         assert_eq!(result, 0);
 
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        #[cfg(target_arch = "x86_64")]
         {
-            let avx2_result = distance_squared_avx2(&vector, &vector);
-            assert_eq!(avx2_result, 0);
+            if std::arch::is_x86_feature_detected!("avx2") {
+                let avx2_result = unsafe { distance_squared_avx2(&vector, &vector) };
+                assert_eq!(avx2_result, 0);
+            }
         }
     }
 
@@ -233,10 +318,12 @@ mod tests {
         let expected = (10000i32 * 10000) * 14;
         assert_eq!(result, expected);
 
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        #[cfg(target_arch = "x86_64")]
         {
-            let avx2_result = distance_squared_avx2(&query, &reference);
-            assert_eq!(result, avx2_result);
+            if std::arch::is_x86_feature_detected!("avx2") {
+                let avx2_result = unsafe { distance_squared_avx2(&query, &reference) };
+                assert_eq!(result, avx2_result);
+            }
         }
     }
 
@@ -260,13 +347,44 @@ mod tests {
         let result_above = distance_squared_with_threshold_scalar(&query, &reference, 40000);
         assert_eq!(result_above, full_distance);
 
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        #[cfg(target_arch = "x86_64")]
         {
-            let avx2_below = distance_squared_with_threshold_avx2(&query, &reference, 30000);
-            assert_eq!(avx2_below, i32::MAX);
+            if std::arch::is_x86_feature_detected!("avx2") {
+                let avx2_below = unsafe {
+                    distance_squared_with_threshold_avx2(&query, &reference, 30000)
+                };
+                assert_eq!(avx2_below, i32::MAX);
 
-            let avx2_above = distance_squared_with_threshold_avx2(&query, &reference, 40000);
-            assert_eq!(avx2_above, full_distance);
+                let avx2_above = unsafe {
+                    distance_squared_with_threshold_avx2(&query, &reference, 40000)
+                };
+                assert_eq!(avx2_above, full_distance);
+            }
+        }
+    }
+
+    #[test]
+    fn block_distance_matches_scalar_per_lane() {
+        let query: [i16; VECTOR_DIMENSIONS] = [
+            100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400,
+        ];
+        let block: [i16; VECTOR_DIMENSIONS * BLOCK_WIDTH] =
+            std::array::from_fn(|index| (index as i16 % 17) * 25 - 200);
+
+        let block_distances = distance_squared_block_with_threshold_scalar(&query, &block, i32::MAX);
+
+        for lane in 0..BLOCK_WIDTH {
+            let reference = std::array::from_fn(|dimension| block[dimension * BLOCK_WIDTH + lane]);
+            assert_eq!(block_distances[lane], distance_squared_scalar(&query, &reference));
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                let avx2_distances =
+                    unsafe { distance_squared_block_with_threshold_avx2(&query, &block, i32::MAX) };
+                assert_eq!(avx2_distances, block_distances);
+            }
         }
     }
 }

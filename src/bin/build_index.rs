@@ -10,7 +10,7 @@ use flate2::read::GzDecoder;
 use serde::Deserialize;
 
 const VECTOR_DIMENSIONS: usize = 14;
-const CLUSTER_COUNT: usize = 4_096;
+const CLUSTER_COUNT: usize = 1_024 * 4;
 const BLOCK_WIDTH: usize = 8;
 const MAX_KMEANS_SAMPLE: usize = 50_000;
 const MAX_KMEANS_ITERATIONS: usize = 25;

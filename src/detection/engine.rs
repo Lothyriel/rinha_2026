@@ -12,7 +12,7 @@ impl FraudEngine {
             index: loader::load_prebuilt_index()?,
         };
 
-        Self::try_new(dataset, normalization, mcc_risk)
+        Self::try_new(dataset, normalization, mcc_risk, load_search_config()?)
     }
 
     pub fn load_example(resources_dir: &Path) -> Result<Self, FraudEngineError> {
@@ -21,13 +21,19 @@ impl FraudEngine {
         let references = loader::load_example_refs(resources_dir)?;
         let index = search::build_ivf_index(&references)?;
 
-        Self::try_new(OwnedDataset { index }, normalization, mcc_risk)
+        Self::try_new(
+            OwnedDataset { index },
+            normalization,
+            mcc_risk,
+            load_search_config()?,
+        )
     }
 
     fn try_new(
         dataset: OwnedDataset,
         normalization: NormalizationConfig,
         mcc_risk: HashMap<String, f32>,
+        search: SearchConfig,
     ) -> Result<Self, FraudEngineError> {
         if dataset.len() < K_NEIGHBORS {
             return Err(FraudEngineError::Load(format!(
@@ -40,6 +46,7 @@ impl FraudEngine {
             normalization,
             mcc_risk,
             dataset,
+            search,
         })
     }
 
@@ -68,4 +75,32 @@ impl FraudEngine {
     pub fn reference_count(&self) -> usize {
         self.dataset.len()
     }
+}
+
+fn load_search_config() -> Result<SearchConfig, FraudEngineError> {
+    Ok(SearchConfig {
+        nprobe: load_optional_env_usize("RINHA_IVF_NPROBE")?,
+    })
+}
+
+fn load_optional_env_usize(name: &str) -> Result<Option<usize>, FraudEngineError> {
+    let Some(raw) = std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let value = raw.parse::<usize>().map_err(|error| {
+        FraudEngineError::Load(format!("invalid {name} value {raw:?}: {error}"))
+    })?;
+
+    if value == 0 {
+        return Err(FraudEngineError::Load(format!(
+            "invalid {name} value {raw:?}: must be greater than zero"
+        )));
+    }
+
+    Ok(Some(value))
 }

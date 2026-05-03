@@ -13,7 +13,7 @@ mod vectorize;
 const K_NEIGHBORS: usize = 5;
 const FRAUD_APPROVAL_THRESHOLD: f32 = 0.6;
 const VECTOR_DIMENSIONS: usize = 14;
-const IVF_CLUSTER_COUNT: usize = 4_096;
+const IVF_CLUSTER_COUNT: usize = 2_048;
 const BLOCK_WIDTH: usize = 8;
 const QUANTIZATION_SCALE: f32 = 10_000.0;
 const PADDED_LABEL_VALUE: u8 = u8::MAX;
@@ -75,11 +75,17 @@ struct OwnedDataset {
     index: IvfIndex,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SearchConfig {
+    nprobe: Option<usize>,
+}
+
 #[derive(Debug)]
 pub struct FraudEngine {
     normalization: NormalizationConfig,
     mcc_risk: HashMap<String, f32>,
     dataset: OwnedDataset,
+    search: SearchConfig,
 }
 
 impl ReferenceLabel {
