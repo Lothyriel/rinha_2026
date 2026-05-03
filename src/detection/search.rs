@@ -233,14 +233,23 @@ fn scan_cluster(
                 continue;
             }
 
-            // Use SIMD distance computation (AVX2 on x86_64, scalar fallback elsewhere)
+            // Use SIMD distance computation with early-exit threshold
+            // This skips remaining dimensions if partial distance already exceeds worst found
             let mut reference = [0i16; VECTOR_DIMENSIONS];
             for dimension in 0..VECTOR_DIMENSIONS {
                 reference[dimension] = quantized_blocks[block_base + dimension * BLOCK_WIDTH + lane];
             }
-            let distance = simd::distance_squared(query, &reference);
+            
+            // Get current worst distance threshold for early-exit
+            let threshold = result.worst_distance(neighbors);
+            
+            // Compute distance with threshold-based early exit
+            let distance = simd::distance_squared_with_threshold(query, &reference, threshold);
 
-            result.insert(distance, label, neighbors);
+            // Only insert if distance is below threshold (i32::MAX indicates early exit)
+            if distance != i32::MAX {
+                result.insert(distance, label, neighbors);
+            }
         }
     }
 }
