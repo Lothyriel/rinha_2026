@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path};
+use std::collections::HashMap;
 
 use serde::Deserialize;
 
@@ -6,52 +6,16 @@ mod engine;
 mod loader;
 mod math;
 mod search;
-mod shared;
 mod vectorize;
 
 const K_NEIGHBORS: usize = 5;
 const FRAUD_APPROVAL_THRESHOLD: f32 = 0.6;
 const VECTOR_DIMENSIONS: usize = 14;
-const PADDED_VECTOR_DIMENSIONS: usize = 16;
-const LEAF_SIZE: usize = 8;
-const VP_NONE: u32 = u32::MAX;
-const EXACT_STACK_CAPACITY: usize = 256;
-const PIVOT_SAMPLE_SIZE: usize = 64;
-const EPSILON: f32 = 1e-6;
-
-#[repr(C, align(32))]
-#[derive(Debug, Clone, Copy)]
-struct Vec16([f32; PADDED_VECTOR_DIMENSIONS]);
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct VpNode {
-    pivot_idx: u32,
-    radius: f32,
-    left: u32,
-    right: u32,
-    start: u32,
-    len: u32,
-}
-
-#[derive(Debug, Clone)]
-struct ExactSearchIndex {
-    nodes: Vec<VpNode>,
-    indices: Vec<u32>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ExactKnnResult {
-    best_distances: [f32; K_NEIGHBORS],
-    best_indices: [u32; K_NEIGHBORS],
-    found: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PointDistance {
-    idx: u32,
-    dist: f32,
-}
+const IVF_CLUSTER_COUNT: usize = 4_096;
+const BLOCK_WIDTH: usize = 8;
+const QUANTIZATION_SCALE: f32 = 10_000.0;
+const PADDED_LABEL_VALUE: u8 = u8::MAX;
+const PREBUILT_INDEX_MAGIC: [u8; 4] = *b"IVF2";
 
 #[derive(Debug, thiserror::Error)]
 pub enum FraudEngineError {
@@ -76,7 +40,7 @@ pub struct NormalizationConfig {
 
 #[derive(Debug, Deserialize)]
 struct RawReferenceEntry {
-    vector: [f32; 14],
+    vector: [f32; VECTOR_DIMENSIONS],
     label: ReferenceLabel,
 }
 
@@ -88,86 +52,80 @@ enum ReferenceLabel {
     Legit,
 }
 
-#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct StoredReference {
-    padded_vector: Vec16,
+    vector: [f32; VECTOR_DIMENSIONS],
     label: ReferenceLabel,
+}
+
+#[derive(Debug, Clone)]
+struct IvfIndex {
+    reference_count: usize,
+    centroids_transposed: Vec<f32>,
+    radii: Vec<f32>,
+    block_offsets: Vec<u32>,
+    labels: Vec<u8>,
+    quantized_blocks: Vec<i16>,
 }
 
 #[derive(Debug)]
 struct OwnedDataset {
-    references: Vec<StoredReference>,
-    index: ExactSearchIndex,
-}
-
-#[derive(Debug)]
-enum DatasetStorage {
-    Owned(OwnedDataset),
-    Shared(shared::MappedDataset),
+    index: IvfIndex,
 }
 
 #[derive(Debug)]
 pub struct FraudEngine {
     normalization: NormalizationConfig,
     mcc_risk: HashMap<String, f32>,
-    dataset: DatasetStorage,
-}
-
-pub fn prebuild_shared_dataset(
-    resources_dir: &Path,
-    mmap_path: &Path,
-) -> Result<(), FraudEngineError> {
-    shared::build_shared_dataset_file(resources_dir, mmap_path, LEAF_SIZE)
+    dataset: OwnedDataset,
 }
 
 impl ReferenceLabel {
-    fn from_storage_byte(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(Self::Fraud),
-            1 => Some(Self::Legit),
-            _ => None,
-        }
-    }
-
     fn to_storage_byte(self) -> u8 {
         self as u8
     }
+
+    fn is_fraud_storage_byte(value: u8) -> bool {
+        value == Self::Fraud as u8
+    }
 }
 
-impl DatasetStorage {
+impl OwnedDataset {
     fn len(&self) -> usize {
-        match self {
-            Self::Owned(dataset) => dataset.references.len(),
-            Self::Shared(dataset) => dataset.len(),
-        }
+        self.index.reference_count
     }
 
-    fn vector(&self, index: usize) -> &Vec16 {
-        match self {
-            Self::Owned(dataset) => &dataset.references[index].padded_vector,
-            Self::Shared(dataset) => dataset.vector(index),
-        }
+    fn cluster_count(&self) -> usize {
+        self.index.cluster_count()
     }
 
-    fn label(&self, index: usize) -> ReferenceLabel {
-        match self {
-            Self::Owned(dataset) => dataset.references[index].label,
-            Self::Shared(dataset) => dataset.label(index),
-        }
+    fn centroid_component(&self, dimension: usize, cluster: usize) -> f32 {
+        self.index.centroid_component(dimension, cluster)
     }
 
-    fn nodes(&self) -> &[VpNode] {
-        match self {
-            Self::Owned(dataset) => &dataset.index.nodes,
-            Self::Shared(dataset) => dataset.nodes(),
-        }
+    fn radius(&self, cluster: usize) -> f32 {
+        self.index.radii[cluster]
     }
 
-    fn indices(&self) -> &[u32] {
-        match self {
-            Self::Owned(dataset) => &dataset.index.indices,
-            Self::Shared(dataset) => dataset.indices(),
-        }
+    fn block_offsets(&self) -> &[u32] {
+        &self.index.block_offsets
+    }
+
+    fn labels(&self) -> &[u8] {
+        &self.index.labels
+    }
+
+    fn quantized_blocks(&self) -> &[i16] {
+        &self.index.quantized_blocks
+    }
+}
+
+impl IvfIndex {
+    fn cluster_count(&self) -> usize {
+        self.radii.len()
+    }
+
+    fn centroid_component(&self, dimension: usize, cluster: usize) -> f32 {
+        self.centroids_transposed[dimension * self.cluster_count() + cluster]
     }
 }

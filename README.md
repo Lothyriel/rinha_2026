@@ -6,8 +6,8 @@ Implementação inicial em Rust para a Rinha de Backend 2026.
 
 - API com `GET /ready` e `POST /fraud-score`
 - Vetorização 14D conforme a spec
-- Busca KNN exata com VP-tree flattenizada + distância euclidiana quadrática
-- Carregamento do dataset oficial via `resources/references.json.gz`
+- Busca KNN exata em espaço quantizado via IVF
+- Carregamento obrigatório do índice pré-gerado `./index.bin`
 - `docker-compose.yml` com nginx + 2 instâncias da API
 
 ## Rodando localmente
@@ -26,19 +26,17 @@ RINHA_UNIX_SOCKET_PATH=/tmp/rinha-api.sock cargo run
 
 Quando `RINHA_UNIX_SOCKET_PATH` está definido, a API passa a escutar apenas no socket informado. Quando não está definido, o comportamento padrão continua sendo TCP na porta `9999`.
 
-Para compartilhar o dataset/index entre processos via arquivo `mmap`:
-
-```bash
-RINHA_SHARED_MMAP_PATH=/tmp/rinha-shared-dataset.bin cargo run
-```
-
-O primeiro processo cria o arquivo mapeado e os próximos apenas o reutilizam em modo leitura.
-
 ## Testes
 
 ```bash
 cargo test
 cargo build --release
+```
+
+O runtime e os testes exigem `./index.bin`. Para regenerar:
+
+```bash
+cargo run --release --bin build_index
 ```
 
 ## Benchmark
@@ -87,7 +85,7 @@ ghcr.io/lothyriel/rinha_2026:v0.*.*
 
 Por padrão a aplicação lê:
 
-- `resources/references.json.gz`
+- `./index.bin`
 - `resources/mcc_risk.json`
 - `resources/normalization.json`
 

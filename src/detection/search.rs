@@ -1,272 +1,496 @@
 use super::*;
 
+const MAX_KMEANS_SAMPLE: usize = 50_000;
+const MAX_KMEANS_ITERATIONS: usize = 25;
+
+#[derive(Debug, Clone, Copy)]
+struct SearchResult {
+    best_distances: [i32; K_NEIGHBORS],
+    best_labels: [u8; K_NEIGHBORS],
+    found: usize,
+}
+
+#[derive(Debug)]
+struct KMeansModel {
+    centroids: Vec<[f32; VECTOR_DIMENSIONS]>,
+    assignments: Vec<u16>,
+}
+
+#[derive(Debug)]
+struct WorkerAccumulation {
+    changed: usize,
+    counts: Vec<u32>,
+    sums: Vec<[f32; VECTOR_DIMENSIONS]>,
+}
+
 impl FraudEngine {
     pub fn classify_knn(
         &self,
         query: &[f32; VECTOR_DIMENSIONS],
         neighbors: usize,
     ) -> (usize, usize) {
-        self.classify_exact(query, neighbors)
-    }
-
-    fn classify_exact(&self, query: &[f32; VECTOR_DIMENSIONS], neighbors: usize) -> (usize, usize) {
         let result = search_exact_knn(&self.dataset, query, neighbors);
-        (result.found, result.fraud_votes(&self.dataset))
+        (result.found, result.fraud_votes())
     }
 }
 
-pub fn build_index(references: &[StoredReference], leaf_size: usize) -> ExactSearchIndex {
-    let mut nodes = Vec::new();
-    let mut indices = Vec::with_capacity(references.len());
-    let mut point_indices = (0..references.len() as u32).collect::<Vec<_>>();
-
-    if !point_indices.is_empty() {
-        build_vp_node(
-            references,
-            &mut point_indices,
-            &mut nodes,
-            &mut indices,
-            1,
-            leaf_size,
-        );
-    }
-
-    ExactSearchIndex { nodes, indices }
-}
-
-fn build_vp_node(
-    references: &[StoredReference],
-    point_indices: &mut [u32],
-    nodes: &mut Vec<VpNode>,
-    leaf_indices: &mut Vec<u32>,
-    depth: usize,
-    leaf_size: usize,
-) -> u32 {
-    let node_idx = nodes.len() as u32;
-    nodes.push(VpNode {
-        pivot_idx: VP_NONE,
-        radius: 0.0,
-        left: VP_NONE,
-        right: VP_NONE,
-        start: 0,
-        len: 0,
-    });
-
-    if point_indices.len() <= leaf_size || depth >= EXACT_STACK_CAPACITY {
-        finalize_leaf_node(nodes, node_idx, point_indices, leaf_indices);
-        return node_idx;
-    }
-
-    let pivot_position = choose_pivot_position(references, point_indices);
-    point_indices.swap(pivot_position, point_indices.len() - 1);
-
-    let pivot_idx = point_indices[point_indices.len() - 1];
-    let pivot = &references[pivot_idx as usize].padded_vector;
-    let candidate_len = point_indices.len() - 1;
-    let candidates = &mut point_indices[..candidate_len];
-
-    if candidates.is_empty() {
-        finalize_leaf_node(nodes, node_idx, point_indices, leaf_indices);
-        return node_idx;
-    }
-
-    let mut distances = candidates
-        .iter()
-        .map(|&idx| PointDistance {
-            idx,
-            dist: math::l2_squared_scalar(pivot, &references[idx as usize].padded_vector),
-        })
-        .collect::<Vec<_>>();
-
-    let median_position = distances.len() / 2;
-    distances.select_nth_unstable_by(median_position, |left, right| {
-        left.dist.total_cmp(&right.dist)
-    });
-
-    let radius = distances[median_position].dist;
-    let mut left_count = 0usize;
-
-    for point in &distances {
-        if point.dist <= radius {
-            candidates[left_count] = point.idx;
-            left_count += 1;
+impl SearchResult {
+    fn new() -> Self {
+        Self {
+            best_distances: [i32::MAX; K_NEIGHBORS],
+            best_labels: [PADDED_LABEL_VALUE; K_NEIGHBORS],
+            found: 0,
         }
     }
 
-    if left_count == 0 || left_count == distances.len() {
-        finalize_leaf_node(nodes, node_idx, point_indices, leaf_indices);
-        return node_idx;
+    fn insert(&mut self, distance: i32, label: u8, neighbors: usize) {
+        let insert_at = self
+            .best_distances
+            .partition_point(|current| *current < distance);
+        if insert_at >= neighbors {
+            return;
+        }
+
+        let upper_bound = self.found.min(neighbors.saturating_sub(1));
+        for index in (insert_at..upper_bound).rev() {
+            self.best_distances[index + 1] = self.best_distances[index];
+            self.best_labels[index + 1] = self.best_labels[index];
+        }
+
+        self.best_distances[insert_at] = distance;
+        self.best_labels[insert_at] = label;
+        self.found = (self.found + 1).min(neighbors);
     }
 
-    let mut write_pos = left_count;
-
-    for point in &distances {
-        if point.dist > radius {
-            candidates[write_pos] = point.idx;
-            write_pos += 1;
+    fn worst_distance(&self, neighbors: usize) -> i32 {
+        if self.found < neighbors {
+            i32::MAX
+        } else {
+            self.best_distances[neighbors - 1]
         }
     }
 
-    let (left_slice, right_slice) = candidates.split_at_mut(left_count);
-    let left = build_vp_node(references, left_slice, nodes, leaf_indices, depth + 1, leaf_size);
-    let right = build_vp_node(references, right_slice, nodes, leaf_indices, depth + 1, leaf_size);
-
-    nodes[node_idx as usize] = VpNode {
-        pivot_idx,
-        radius,
-        left,
-        right,
-        start: 0,
-        len: 0,
-    };
-
-    node_idx
+    fn fraud_votes(&self) -> usize {
+        self.best_labels[..self.found]
+            .iter()
+            .filter(|&&label| ReferenceLabel::is_fraud_storage_byte(label))
+            .count()
+    }
 }
 
-fn finalize_leaf_node(
-    nodes: &mut [VpNode],
-    node_idx: u32,
-    point_indices: &[u32],
-    leaf_indices: &mut Vec<u32>,
-) {
-    let start = leaf_indices.len() as u32;
-    leaf_indices.extend_from_slice(point_indices);
-    nodes[node_idx as usize] = VpNode {
-        pivot_idx: VP_NONE,
-        radius: 0.0,
-        left: VP_NONE,
-        right: VP_NONE,
-        start,
-        len: point_indices.len() as u32,
-    };
-}
-
-fn choose_pivot_position(references: &[StoredReference], point_indices: &[u32]) -> usize {
-    let sample_len = point_indices.len().min(PIVOT_SAMPLE_SIZE);
-
-    if sample_len <= 1 {
-        return 0;
+pub fn build_ivf_index(references: &[StoredReference]) -> Result<IvfIndex, FraudEngineError> {
+    if references.is_empty() {
+        return Ok(IvfIndex {
+            reference_count: 0,
+            centroids_transposed: Vec::new(),
+            radii: Vec::new(),
+            block_offsets: vec![0],
+            labels: Vec::new(),
+            quantized_blocks: Vec::new(),
+        });
     }
 
-    let step = point_indices.len().div_ceil(sample_len);
-    let mut sampled_positions = [0usize; PIVOT_SAMPLE_SIZE];
+    let model = train_kmeans(references)?;
+    let cluster_count = model.centroids.len();
+    let quantized_centroids = quantized_centroids(&model.centroids);
 
-    for (index, position) in sampled_positions.iter_mut().take(sample_len).enumerate() {
-        *position = (index * step).min(point_indices.len() - 1);
+    let mut cluster_sizes = vec![0usize; cluster_count];
+    for &assignment in &model.assignments {
+        cluster_sizes[assignment as usize] += 1;
     }
 
-    let mut best_position = sampled_positions[0];
-    let mut best_mean_distance = f32::NEG_INFINITY;
+    let mut vector_offsets = Vec::with_capacity(cluster_count + 1);
+    vector_offsets.push(0usize);
+    for &size in &cluster_sizes {
+        vector_offsets.push(vector_offsets.last().copied().unwrap_or(0) + size);
+    }
 
-    for &candidate_position in sampled_positions.iter().take(sample_len) {
-        let candidate = &references[point_indices[candidate_position] as usize].padded_vector;
-        let mut total_distance = 0.0f32;
+    let mut grouped_indices = vec![0usize; references.len()];
+    let mut write_positions = vector_offsets[..cluster_count].to_vec();
+    let mut radii = vec![0.0f32; cluster_count];
 
-        for &comparison_position in sampled_positions.iter().take(sample_len) {
-            if comparison_position == candidate_position {
-                continue;
+    for (reference_index, reference) in references.iter().enumerate() {
+        let cluster = model.assignments[reference_index] as usize;
+        let position = write_positions[cluster];
+        grouped_indices[position] = reference_index;
+        write_positions[cluster] += 1;
+
+        let cluster_centroids = quantized_centroids[cluster];
+
+        let mut distance_sq = 0.0f32;
+        for (dimension, &value) in reference.vector.iter().enumerate() {
+            let delta = math::quantized_as_f32(value) - cluster_centroids[dimension];
+            distance_sq += delta * delta;
+        }
+        radii[cluster] = radii[cluster].max(distance_sq.sqrt());
+    }
+
+    let mut block_offsets = Vec::with_capacity(cluster_count + 1);
+    block_offsets.push(0u32);
+    for &size in &cluster_sizes {
+        let next = block_offsets.last().copied().unwrap_or(0)
+            + u32::try_from(size.div_ceil(BLOCK_WIDTH)).map_err(|_| {
+                FraudEngineError::Load("cluster block count exceeds u32 range".to_owned())
+            })?;
+        block_offsets.push(next);
+    }
+
+    let total_blocks = block_offsets.last().copied().unwrap_or(0) as usize;
+    let mut labels = vec![PADDED_LABEL_VALUE; total_blocks * BLOCK_WIDTH];
+    let mut quantized_blocks = vec![i16::MAX; total_blocks * VECTOR_DIMENSIONS * BLOCK_WIDTH];
+
+    for cluster in 0..cluster_count {
+        let cluster_start = vector_offsets[cluster];
+        let cluster_end = vector_offsets[cluster + 1];
+        let block_start = block_offsets[cluster] as usize;
+
+        for (local_index, &reference_index) in grouped_indices[cluster_start..cluster_end]
+            .iter()
+            .enumerate()
+        {
+            let block_index = block_start + (local_index / BLOCK_WIDTH);
+            let lane = local_index % BLOCK_WIDTH;
+            let label_offset = block_index * BLOCK_WIDTH + lane;
+            labels[label_offset] = references[reference_index].label.to_storage_byte();
+
+            for dimension in 0..VECTOR_DIMENSIONS {
+                let block_value_offset =
+                    block_index * VECTOR_DIMENSIONS * BLOCK_WIDTH + dimension * BLOCK_WIDTH + lane;
+                quantized_blocks[block_value_offset] =
+                    math::quantize(references[reference_index].vector[dimension]);
             }
-
-            total_distance += math::l2_squared_scalar(
-                candidate,
-                &references[point_indices[comparison_position] as usize].padded_vector,
-            );
-        }
-
-        let mean_distance = total_distance / (sample_len.saturating_sub(1) as f32);
-
-        if mean_distance > best_mean_distance {
-            best_mean_distance = mean_distance;
-            best_position = candidate_position;
         }
     }
 
-    best_position
-}
-
-pub fn search_exact_knn(
-    dataset: &DatasetStorage,
-    query: &[f32; VECTOR_DIMENSIONS],
-    neighbors: usize,
-) -> ExactKnnResult {
-    let query = Vec16::from_query(query);
-
-    search_exact_knn_with_distance(dataset, &query, neighbors, |left, right| unsafe {
-        math::l2_squared_avx(left, right)
+    Ok(IvfIndex {
+        reference_count: references.len(),
+        centroids_transposed: transpose_centroids(&quantized_centroids),
+        radii,
+        block_offsets,
+        labels,
+        quantized_blocks,
     })
 }
 
-fn search_exact_knn_with_distance(
-    dataset: &DatasetStorage,
-    query: &Vec16,
+fn search_exact_knn(
+    dataset: &OwnedDataset,
+    query: &[f32; VECTOR_DIMENSIONS],
     neighbors: usize,
-    distance_fn: impl Fn(&Vec16, &Vec16) -> f32,
-) -> ExactKnnResult {
-    let mut result = ExactKnnResult::new();
-    let nodes = dataset.nodes();
-
-    if nodes.is_empty() || neighbors == 0 {
+) -> SearchResult {
+    let mut result = SearchResult::new();
+    if dataset.len() == 0 || neighbors == 0 || dataset.cluster_count() == 0 {
         return result;
     }
 
-    let mut stack = [VP_NONE; EXACT_STACK_CAPACITY];
-    let mut stack_len = 1usize;
-    stack[0] = 0;
+    let quantized_query: [i16; VECTOR_DIMENSIONS] =
+        std::array::from_fn(|dimension| math::quantize(query[dimension]));
+    let query_quantized_f32 = quantized_query.map(|value| value as f32);
+    let mut cluster_order = (0..dataset.cluster_count())
+        .map(|cluster| {
+            (
+                cluster,
+                centroid_distance_squared(dataset, &query_quantized_f32, cluster),
+            )
+        })
+        .collect::<Vec<_>>();
+    cluster_order.sort_unstable_by(|left, right| left.1.total_cmp(&right.1));
 
-    while stack_len > 0 {
-        stack_len -= 1;
-        let node = &nodes[stack[stack_len] as usize];
-
-        if node.len > 0 {
-            let leaf_start = node.start as usize;
-            let leaf_end = leaf_start + node.len as usize;
-
-            for &reference_idx in &dataset.indices()[leaf_start..leaf_end] {
-                let distance = distance_fn(query, dataset.vector(reference_idx as usize));
-                result.insert(reference_idx, distance, neighbors);
+    for (cluster, centroid_distance_sq) in cluster_order {
+        if result.found >= neighbors {
+            let lower_bound = centroid_distance_sq.sqrt() - dataset.radius(cluster);
+            let bounded = lower_bound.max(0.0);
+            if bounded * bounded > result.worst_distance(neighbors) as f32 {
+                continue;
             }
-
-            continue;
         }
 
-        let pivot_idx = node.pivot_idx as usize;
-        let pivot_distance = distance_fn(query, dataset.vector(pivot_idx));
-        result.insert(node.pivot_idx, pivot_distance, neighbors);
-
-        let (near, far) = if pivot_distance <= node.radius {
-            (node.left, node.right)
-        } else {
-            (node.right, node.left)
-        };
-
-        let can_visit_far = if far == VP_NONE {
-            false
-        } else if result.found < neighbors {
-            true
-        } else {
-            let worst_distance = result.worst_distance(neighbors);
-            (pivot_distance.sqrt() - node.radius.sqrt()).abs() <= worst_distance.sqrt() + EPSILON
-        };
-
-        if can_visit_far {
-            push_stack(&mut stack, &mut stack_len, far);
-        }
-
-        if near != VP_NONE {
-            push_stack(&mut stack, &mut stack_len, near);
-        }
+        scan_cluster(dataset, &quantized_query, cluster, neighbors, &mut result);
     }
 
     result
 }
 
-fn push_stack(stack: &mut [u32; EXACT_STACK_CAPACITY], stack_len: &mut usize, value: u32) {
-    assert!(
-        *stack_len < EXACT_STACK_CAPACITY,
-        "vp-tree traversal stack exceeded capacity"
-    );
-    stack[*stack_len] = value;
-    *stack_len += 1;
+fn scan_cluster(
+    dataset: &OwnedDataset,
+    query: &[i16; VECTOR_DIMENSIONS],
+    cluster: usize,
+    neighbors: usize,
+    result: &mut SearchResult,
+) {
+    let block_offsets = dataset.block_offsets();
+    let labels = dataset.labels();
+    let quantized_blocks = dataset.quantized_blocks();
+    let block_start = block_offsets[cluster] as usize;
+    let block_end = block_offsets[cluster + 1] as usize;
+
+    for block_index in block_start..block_end {
+        let block_base = block_index * VECTOR_DIMENSIONS * BLOCK_WIDTH;
+        let label_base = block_index * BLOCK_WIDTH;
+
+        for lane in 0..BLOCK_WIDTH {
+            let label = labels[label_base + lane];
+            if label == PADDED_LABEL_VALUE {
+                continue;
+            }
+
+            let mut distance = 0i32;
+            for dimension in 0..VECTOR_DIMENSIONS {
+                let value = quantized_blocks[block_base + dimension * BLOCK_WIDTH + lane] as i32;
+                let delta = value - query[dimension] as i32;
+                distance += delta * delta;
+            }
+
+            result.insert(distance, label, neighbors);
+        }
+    }
+}
+
+fn centroid_distance_squared(
+    dataset: &OwnedDataset,
+    query: &[f32; VECTOR_DIMENSIONS],
+    cluster: usize,
+) -> f32 {
+    let mut total = 0.0f32;
+
+    for (dimension, value) in query.iter().enumerate() {
+        let delta = value - dataset.centroid_component(dimension, cluster);
+        total += delta * delta;
+    }
+
+    total
+}
+
+fn train_kmeans(references: &[StoredReference]) -> Result<KMeansModel, FraudEngineError> {
+    let cluster_count = references.len().min(IVF_CLUSTER_COUNT);
+    let sample_size = references.len().min(MAX_KMEANS_SAMPLE).max(cluster_count);
+    let mut rng = SplitMix64::seeded(0x51f1_2026_d15c_a11e);
+    let sample_indices = reservoir_sample_indices(references.len(), sample_size, &mut rng);
+    let sample_vectors = sample_indices
+        .iter()
+        .map(|&index| references[index].vector)
+        .collect::<Vec<_>>();
+
+    let mut centroids = initialize_centroids_kmeans_pp(&sample_vectors, cluster_count, &mut rng);
+    let mut assignments = vec![u16::MAX; references.len()];
+    let convergence_threshold = (references.len() / 10_000).max(8);
+
+    for _ in 0..MAX_KMEANS_ITERATIONS {
+        let worker_count = std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1)
+            .min(references.len().max(1));
+        let chunk_size = references.len().div_ceil(worker_count);
+        let mut next_assignments = vec![0u16; references.len()];
+        let mut total_changed = 0usize;
+        let mut counts = vec![0u32; cluster_count];
+        let mut sums = vec![[0.0; VECTOR_DIMENSIONS]; cluster_count];
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+
+            for (worker_index, next_chunk) in next_assignments.chunks_mut(chunk_size).enumerate() {
+                let start = worker_index * chunk_size;
+                let end = start + next_chunk.len();
+                let reference_chunk = &references[start..end];
+                let previous_chunk = &assignments[start..end];
+                let centroid_slice = &centroids;
+
+                handles.push(scope.spawn(move || {
+                    assign_chunk(reference_chunk, previous_chunk, next_chunk, centroid_slice)
+                }));
+            }
+
+            for handle in handles {
+                let partial = handle.join().expect("k-means worker thread panicked");
+                total_changed += partial.changed;
+
+                for (cluster, count) in partial.counts.into_iter().enumerate() {
+                    counts[cluster] += count;
+                }
+
+                for (cluster, cluster_sums) in partial.sums.into_iter().enumerate() {
+                    for (dimension, value) in cluster_sums.into_iter().enumerate() {
+                        sums[cluster][dimension] += value;
+                    }
+                }
+            }
+        });
+
+        for cluster in 0..cluster_count {
+            if counts[cluster] == 0 {
+                continue;
+            }
+
+            let scale = 1.0 / counts[cluster] as f32;
+            for dimension in 0..VECTOR_DIMENSIONS {
+                centroids[cluster][dimension] = sums[cluster][dimension] * scale;
+            }
+        }
+
+        assignments = next_assignments;
+        if total_changed <= convergence_threshold {
+            break;
+        }
+    }
+
+    Ok(KMeansModel {
+        centroids,
+        assignments,
+    })
+}
+
+fn assign_chunk(
+    references: &[StoredReference],
+    previous_assignments: &[u16],
+    next_assignments: &mut [u16],
+    centroids: &[[f32; VECTOR_DIMENSIONS]],
+) -> WorkerAccumulation {
+    let mut changed = 0usize;
+    let mut counts = vec![0u32; centroids.len()];
+    let mut sums = vec![[0.0; VECTOR_DIMENSIONS]; centroids.len()];
+
+    for (index, reference) in references.iter().enumerate() {
+        let nearest = nearest_centroid(&reference.vector, centroids);
+        let nearest_u16 = nearest as u16;
+        next_assignments[index] = nearest_u16;
+
+        if previous_assignments[index] != nearest_u16 {
+            changed += 1;
+        }
+
+        counts[nearest] += 1;
+        for (dimension, value) in reference.vector.iter().enumerate() {
+            sums[nearest][dimension] += value;
+        }
+    }
+
+    WorkerAccumulation {
+        changed,
+        counts,
+        sums,
+    }
+}
+
+fn initialize_centroids_kmeans_pp(
+    sample_vectors: &[[f32; VECTOR_DIMENSIONS]],
+    centroid_count: usize,
+    rng: &mut SplitMix64,
+) -> Vec<[f32; VECTOR_DIMENSIONS]> {
+    let mut centroids = Vec::with_capacity(centroid_count);
+    centroids.push(sample_vectors[rng.gen_bounded_usize(sample_vectors.len())]);
+    let mut nearest_distances = vec![f32::INFINITY; sample_vectors.len()];
+
+    while centroids.len() < centroid_count {
+        let newest_centroid = centroids.last().expect("centroid exists");
+        for (index, vector) in sample_vectors.iter().enumerate() {
+            let distance = math::l2_squared(vector, newest_centroid);
+            if distance < nearest_distances[index] {
+                nearest_distances[index] = distance;
+            }
+        }
+
+        let total_weight = nearest_distances.iter().copied().sum::<f32>();
+        let next_index = if total_weight <= 0.0 {
+            rng.gen_bounded_usize(sample_vectors.len())
+        } else {
+            let mut target = rng.next_f32() * total_weight;
+            let mut selected = sample_vectors.len() - 1;
+            for (index, &weight) in nearest_distances.iter().enumerate() {
+                target -= weight;
+                if target <= 0.0 {
+                    selected = index;
+                    break;
+                }
+            }
+            selected
+        };
+
+        centroids.push(sample_vectors[next_index]);
+    }
+
+    centroids
+}
+
+fn quantized_centroids(centroids: &[[f32; VECTOR_DIMENSIONS]]) -> Vec<[f32; VECTOR_DIMENSIONS]> {
+    centroids
+        .iter()
+        .map(|centroid| centroid.map(math::quantized_as_f32))
+        .collect()
+}
+
+fn transpose_centroids(centroids: &[[f32; VECTOR_DIMENSIONS]]) -> Vec<f32> {
+    let mut transposed = Vec::with_capacity(VECTOR_DIMENSIONS * centroids.len());
+
+    for dimension in 0..VECTOR_DIMENSIONS {
+        for centroid in centroids {
+            transposed.push(centroid[dimension]);
+        }
+    }
+
+    transposed
+}
+
+fn nearest_centroid(
+    vector: &[f32; VECTOR_DIMENSIONS],
+    centroids: &[[f32; VECTOR_DIMENSIONS]],
+) -> usize {
+    let mut best_index = 0usize;
+    let mut best_distance = f32::INFINITY;
+
+    for (index, centroid) in centroids.iter().enumerate() {
+        let distance = math::l2_squared(vector, centroid);
+        if distance < best_distance {
+            best_distance = distance;
+            best_index = index;
+        }
+    }
+
+    best_index
+}
+
+fn reservoir_sample_indices(len: usize, sample_size: usize, rng: &mut SplitMix64) -> Vec<usize> {
+    let mut sample = (0..sample_size).collect::<Vec<_>>();
+
+    for index in sample_size..len {
+        let replacement = rng.gen_bounded_usize(index + 1);
+        if replacement < sample_size {
+            sample[replacement] = index;
+        }
+    }
+
+    sample
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn seeded(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn next_f32(&mut self) -> f32 {
+        let value = (self.next_u64() >> 40) as u32;
+        value as f32 / ((1u32 << 24) as f32)
+    }
+
+    fn gen_bounded_usize(&mut self, upper_bound: usize) -> usize {
+        if upper_bound <= 1 {
+            0
+        } else {
+            (self.next_u64() % upper_bound as u64) as usize
+        }
+    }
 }
 
 #[cfg(test)]
@@ -277,7 +501,7 @@ mod tests {
 
     fn test_reference(vector: [f32; VECTOR_DIMENSIONS], is_fraud: bool) -> StoredReference {
         StoredReference {
-            padded_vector: Vec16::from_vector(vector),
+            vector,
             label: if is_fraud {
                 ReferenceLabel::Fraud
             } else {
@@ -287,26 +511,28 @@ mod tests {
     }
 
     fn brute_force_knn(
-        dataset: &DatasetStorage,
+        references: &[StoredReference],
         query: &[f32; VECTOR_DIMENSIONS],
         neighbors: usize,
-    ) -> ExactKnnResult {
-        let query = Vec16::from_query(query);
-        let mut result = ExactKnnResult::new();
+    ) -> SearchResult {
+        let quantized_query: [i16; VECTOR_DIMENSIONS] =
+            std::array::from_fn(|dimension| math::quantize(query[dimension]));
+        let mut result = SearchResult::new();
 
-        for index in 0..dataset.len() {
-            result.insert(
-                index as u32,
-                math::l2_squared_scalar(&query, dataset.vector(index)),
-                neighbors,
-            );
+        for reference in references {
+            let mut distance = 0i32;
+            for (dimension, &value) in reference.vector.iter().enumerate() {
+                let delta = math::quantize(value) as i32 - quantized_query[dimension] as i32;
+                distance += delta * delta;
+            }
+            result.insert(distance, reference.label.to_storage_byte(), neighbors);
         }
 
         result
     }
 
     fn synthetic_engine(references: Vec<StoredReference>) -> FraudEngine {
-        let index = build_index(&references, LEAF_SIZE);
+        let index = build_ivf_index(&references).expect("ivf index should build");
 
         FraudEngine {
             normalization: NormalizationConfig {
@@ -319,7 +545,7 @@ mod tests {
                 max_merchant_avg_amount: 1.0,
             },
             mcc_risk: HashMap::new(),
-            dataset: DatasetStorage::Owned(OwnedDataset { references, index }),
+            dataset: OwnedDataset { index },
         }
     }
 
@@ -327,7 +553,6 @@ mod tests {
         *state = state
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1);
-
         ((*state >> 32) as u32) as f32 / u32::MAX as f32
     }
 
@@ -337,11 +562,9 @@ mod tests {
         (0..len)
             .map(|index| {
                 let mut vector = [0.0; VECTOR_DIMENSIONS];
-
                 for value in &mut vector {
                     *value = next_random_unit(&mut state);
                 }
-
                 test_reference(vector, index % 3 == 0)
             })
             .collect()
@@ -349,16 +572,14 @@ mod tests {
 
     fn random_query(state: &mut u64) -> [f32; VECTOR_DIMENSIONS] {
         let mut query = [0.0; VECTOR_DIMENSIONS];
-
         for value in &mut query {
             *value = next_random_unit(state);
         }
-
         query
     }
 
     #[test]
-    fn vp_tree_exact_search_matches_bruteforce_knn() {
+    fn ivf_quantized_exact_search_matches_bruteforce_knn() {
         let references = (0..96u32)
             .map(|value| {
                 let vector = std::array::from_fn(|dimension| {
@@ -370,7 +591,7 @@ mod tests {
                 test_reference(vector, value % 3 == 0)
             })
             .collect::<Vec<_>>();
-        let engine = synthetic_engine(references);
+        let engine = synthetic_engine(references.clone());
         let queries = [
             [
                 0.11, 0.07, 0.43, 0.29, 0.31, 0.17, 0.23, 0.19, 0.41, 0.13, 0.37, 0.47, 0.53, 0.59,
@@ -385,61 +606,28 @@ mod tests {
 
         for query in queries {
             let exact = search_exact_knn(&engine.dataset, &query, K_NEIGHBORS);
-            let brute_force = brute_force_knn(&engine.dataset, &query, K_NEIGHBORS);
+            let brute_force = brute_force_knn(&references, &query, K_NEIGHBORS);
 
             assert_eq!(exact.found, brute_force.found);
-            assert_eq!(exact.best_indices, brute_force.best_indices);
-
-            for (left, right) in exact
-                .best_distances
-                .iter()
-                .zip(brute_force.best_distances.iter())
-            {
-                assert!((left - right).abs() < 0.0001);
-            }
+            assert_eq!(exact.best_distances, brute_force.best_distances);
+            assert_eq!(exact.fraud_votes(), brute_force.fraud_votes());
         }
     }
 
     #[test]
-    fn vp_tree_handles_identical_vectors_without_degenerate_recursion() {
-        let references = (0..48u32)
-            .map(|value| test_reference([0.25; VECTOR_DIMENSIONS], value % 2 == 0))
-            .collect::<Vec<_>>();
-        let engine = synthetic_engine(references);
-        let query = [0.25; VECTOR_DIMENSIONS];
-
-        let exact = search_exact_knn(&engine.dataset, &query, K_NEIGHBORS);
-
-        assert_eq!(exact.found, K_NEIGHBORS);
-        assert_eq!(engine.dataset.nodes().len(), 1);
-        assert_eq!(engine.dataset.nodes()[0].len, 48);
-        assert!(
-            exact.best_distances[..exact.found]
-                .iter()
-                .all(|distance| *distance == 0.0)
-        );
-    }
-
-    #[test]
-    fn vp_tree_exact_search_matches_bruteforce_across_large_random_dataset() {
-        let engine = synthetic_engine(generate_random_dataset(4_096, 0x5eed_f00d_dead_beef));
+    fn ivf_quantized_exact_search_matches_bruteforce_across_large_random_dataset() {
+        let references = generate_random_dataset(1_024, 0x5eed_f00d_dead_beef);
+        let engine = synthetic_engine(references.clone());
         let mut query_state = 0x1234_5678_9abc_def0;
 
-        for _ in 0..256 {
+        for _ in 0..32 {
             let query = random_query(&mut query_state);
             let exact = search_exact_knn(&engine.dataset, &query, K_NEIGHBORS);
-            let brute_force = brute_force_knn(&engine.dataset, &query, K_NEIGHBORS);
+            let brute_force = brute_force_knn(&references, &query, K_NEIGHBORS);
 
             assert_eq!(exact.found, brute_force.found);
-            assert_eq!(exact.best_indices, brute_force.best_indices);
-
-            for (left, right) in exact
-                .best_distances
-                .iter()
-                .zip(brute_force.best_distances.iter())
-            {
-                assert!((left - right).abs() < 0.0001);
-            }
+            assert_eq!(exact.best_distances, brute_force.best_distances);
+            assert_eq!(exact.fraud_votes(), brute_force.fraud_votes());
         }
     }
 }

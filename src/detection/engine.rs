@@ -6,69 +6,29 @@ use super::*;
 
 impl FraudEngine {
     pub fn load(resources_dir: &Path) -> Result<Self, FraudEngineError> {
-        Self::load_with_leaf_size(resources_dir, LEAF_SIZE)
-    }
-
-    pub fn load_with_leaf_size(
-        resources_dir: &Path,
-        leaf_size: usize,
-    ) -> Result<Self, FraudEngineError> {
         let normalization = loader::load_json_file(resources_dir.join("normalization.json"))?;
         let mcc_risk = loader::load_json_file(resources_dir.join("mcc_risk.json"))?;
-
-        let dataset = if let Some(shared_path) = std::env::var("RINHA_SHARED_MMAP_PATH")
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-        {
-            DatasetStorage::Shared(shared::load_or_create_mapped_dataset(
-                resources_dir,
-                Path::new(&shared_path),
-                leaf_size,
-            )?)
-        } else {
-            let references = loader::load_refs(resources_dir)?;
-            let index = search::build_index(&references, leaf_size);
-
-            DatasetStorage::Owned(OwnedDataset { references, index })
+        let dataset = OwnedDataset {
+            index: loader::load_prebuilt_index()?,
         };
 
-        Self::try_new(dataset, normalization, mcc_risk, leaf_size)
+        Self::try_new(dataset, normalization, mcc_risk)
     }
 
     pub fn load_example(resources_dir: &Path) -> Result<Self, FraudEngineError> {
-        Self::load_example_with_leaf_size(resources_dir, LEAF_SIZE)
-    }
-
-    pub fn load_example_with_leaf_size(
-        resources_dir: &Path,
-        leaf_size: usize,
-    ) -> Result<Self, FraudEngineError> {
         let normalization = loader::load_json_file(resources_dir.join("normalization.json"))?;
         let mcc_risk = loader::load_json_file(resources_dir.join("mcc_risk.json"))?;
         let references = loader::load_example_refs(resources_dir)?;
-        let index = search::build_index(&references, leaf_size);
+        let index = search::build_ivf_index(&references)?;
 
-        Self::try_new(
-            DatasetStorage::Owned(OwnedDataset { references, index }),
-            normalization,
-            mcc_risk,
-            leaf_size,
-        )
+        Self::try_new(OwnedDataset { index }, normalization, mcc_risk)
     }
 
     fn try_new(
-        dataset: DatasetStorage,
+        dataset: OwnedDataset,
         normalization: NormalizationConfig,
         mcc_risk: HashMap<String, f32>,
-        leaf_size: usize,
     ) -> Result<Self, FraudEngineError> {
-        if leaf_size == 0 {
-            return Err(FraudEngineError::Load(
-                "exact leaf size must be greater than zero".to_owned(),
-            ));
-        }
-
         if dataset.len() < K_NEIGHBORS {
             return Err(FraudEngineError::Load(format!(
                 "reference dataset must contain at least {K_NEIGHBORS} vectors, found {}",
