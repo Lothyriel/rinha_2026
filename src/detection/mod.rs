@@ -7,6 +7,7 @@ mod loader;
 mod math;
 mod search;
 pub mod simd;
+mod topk;
 mod vectorize;
 
 const K_NEIGHBORS: usize = 5;

@@ -3,12 +3,7 @@ use super::*;
 const MAX_KMEANS_SAMPLE: usize = 50_000;
 const MAX_KMEANS_ITERATIONS: usize = 25;
 
-#[derive(Debug, Clone, Copy)]
-struct SearchResult {
-    best_distances: [i32; K_NEIGHBORS],
-    best_labels: [u8; K_NEIGHBORS],
-    found: usize,
-}
+
 
 #[derive(Debug)]
 struct KMeansModel {
@@ -29,54 +24,10 @@ impl FraudEngine {
         query: &[f32; VECTOR_DIMENSIONS],
         neighbors: usize,
     ) -> (usize, usize) {
-        let result = search_exact_knn(&self.dataset, query, neighbors);
-        (result.found, result.fraud_votes())
+        search_exact_knn(&self.dataset, query, neighbors)
     }
 }
 
-impl SearchResult {
-    fn new() -> Self {
-        Self {
-            best_distances: [i32::MAX; K_NEIGHBORS],
-            best_labels: [PADDED_LABEL_VALUE; K_NEIGHBORS],
-            found: 0,
-        }
-    }
-
-    fn insert(&mut self, distance: i32, label: u8, neighbors: usize) {
-        let insert_at = self
-            .best_distances
-            .partition_point(|current| *current < distance);
-        if insert_at >= neighbors {
-            return;
-        }
-
-        let upper_bound = self.found.min(neighbors.saturating_sub(1));
-        for index in (insert_at..upper_bound).rev() {
-            self.best_distances[index + 1] = self.best_distances[index];
-            self.best_labels[index + 1] = self.best_labels[index];
-        }
-
-        self.best_distances[insert_at] = distance;
-        self.best_labels[insert_at] = label;
-        self.found = (self.found + 1).min(neighbors);
-    }
-
-    fn worst_distance(&self, neighbors: usize) -> i32 {
-        if self.found < neighbors {
-            i32::MAX
-        } else {
-            self.best_distances[neighbors - 1]
-        }
-    }
-
-    fn fraud_votes(&self) -> usize {
-        self.best_labels[..self.found]
-            .iter()
-            .filter(|&&label| ReferenceLabel::is_fraud_storage_byte(label))
-            .count()
-    }
-}
 
 pub fn build_ivf_index(references: &[StoredReference]) -> Result<IvfIndex, FraudEngineError> {
     if references.is_empty() {
@@ -176,10 +127,10 @@ fn search_exact_knn(
     dataset: &OwnedDataset,
     query: &[f32; VECTOR_DIMENSIONS],
     neighbors: usize,
-) -> SearchResult {
-    let mut result = SearchResult::new();
+) -> (usize, usize) {
+    let mut result = topk::SortedTopK::new();
     if dataset.len() == 0 || neighbors == 0 || dataset.cluster_count() == 0 {
-        return result;
+        return (0, 0);
     }
 
     let quantized_query: [i16; VECTOR_DIMENSIONS] =
@@ -207,7 +158,7 @@ fn search_exact_knn(
         scan_cluster(dataset, &quantized_query, cluster, neighbors, &mut result);
     }
 
-    result
+    result.finalize(neighbors)
 }
 
 fn scan_cluster(
@@ -215,7 +166,7 @@ fn scan_cluster(
     query: &[i16; VECTOR_DIMENSIONS],
     cluster: usize,
     neighbors: usize,
-    result: &mut SearchResult,
+    result: &mut topk::SortedTopK,
 ) {
     let block_offsets = dataset.block_offsets();
     let labels = dataset.labels();
@@ -523,10 +474,10 @@ mod tests {
         references: &[StoredReference],
         query: &[f32; VECTOR_DIMENSIONS],
         neighbors: usize,
-    ) -> SearchResult {
+    ) -> (usize, usize) {
         let quantized_query: [i16; VECTOR_DIMENSIONS] =
             std::array::from_fn(|dimension| math::quantize(query[dimension]));
-        let mut result = SearchResult::new();
+        let mut result = topk::SortedTopK::new();
 
         for reference in references {
             let mut distance = 0i32;
@@ -537,7 +488,7 @@ mod tests {
             result.insert(distance, reference.label.to_storage_byte(), neighbors);
         }
 
-        result
+        result.finalize(neighbors)
     }
 
     fn synthetic_engine(references: Vec<StoredReference>) -> FraudEngine {
@@ -617,9 +568,8 @@ mod tests {
             let exact = search_exact_knn(&engine.dataset, &query, K_NEIGHBORS);
             let brute_force = brute_force_knn(&references, &query, K_NEIGHBORS);
 
-            assert_eq!(exact.found, brute_force.found);
-            assert_eq!(exact.best_distances, brute_force.best_distances);
-            assert_eq!(exact.fraud_votes(), brute_force.fraud_votes());
+            assert_eq!(exact.0, brute_force.0);
+            assert_eq!(exact.1, brute_force.1);
         }
     }
 
@@ -634,9 +584,8 @@ mod tests {
             let exact = search_exact_knn(&engine.dataset, &query, K_NEIGHBORS);
             let brute_force = brute_force_knn(&references, &query, K_NEIGHBORS);
 
-            assert_eq!(exact.found, brute_force.found);
-            assert_eq!(exact.best_distances, brute_force.best_distances);
-            assert_eq!(exact.fraud_votes(), brute_force.fraud_votes());
+            assert_eq!(exact.0, brute_force.0);
+            assert_eq!(exact.1, brute_force.1);
         }
     }
 }
