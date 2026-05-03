@@ -233,12 +233,12 @@ fn scan_cluster(
                 continue;
             }
 
-            let mut distance = 0i32;
+            // Use SIMD distance computation (AVX2 on x86_64, scalar fallback elsewhere)
+            let mut reference = [0i16; VECTOR_DIMENSIONS];
             for dimension in 0..VECTOR_DIMENSIONS {
-                let value = quantized_blocks[block_base + dimension * BLOCK_WIDTH + lane] as i32;
-                let delta = value - query[dimension] as i32;
-                distance += delta * delta;
+                reference[dimension] = quantized_blocks[block_base + dimension * BLOCK_WIDTH + lane];
             }
+            let distance = simd::distance_squared(query, &reference);
 
             result.insert(distance, label, neighbors);
         }
