@@ -1,5 +1,5 @@
 x-api-template: &api-template
-  image: ghcr.io/lothyriel/rinha_2026:v6.7.1
+  image: ghcr.io/lothyriel/rinha_2026:v6.7.2
   platform: linux/amd64
   volumes:
     - sockets:/sockets
