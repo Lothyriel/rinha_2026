@@ -218,9 +218,7 @@ pub fn distance_squared(
 ) -> i32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            return unsafe { distance_squared_avx2(query, reference) };
-        }
+        return unsafe { distance_squared_avx2(query, reference) };
     }
 
     distance_squared_scalar(query, reference)
@@ -235,9 +233,7 @@ pub fn distance_squared_with_threshold(
 ) -> i32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            return unsafe { distance_squared_with_threshold_avx2(query, reference, threshold) };
-        }
+        return unsafe { distance_squared_with_threshold_avx2(query, reference, threshold) };
     }
 
     distance_squared_with_threshold_scalar(query, reference, threshold)
@@ -251,12 +247,101 @@ pub fn distance_squared_block_with_threshold(
 ) -> [i32; BLOCK_WIDTH] {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            return unsafe { distance_squared_block_with_threshold_avx2(query, block, threshold) };
-        }
+        return unsafe { distance_squared_block_with_threshold_avx2(query, block, threshold) };
     }
 
     distance_squared_block_with_threshold_scalar(query, block, threshold)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+pub unsafe fn centroid_distances_avx2_f32(
+    query: &[f32; VECTOR_DIMENSIONS],
+    centroids_transposed: &[f32],
+    cluster_count: usize,
+    out: &mut [f32],
+) {
+    debug_assert!(out.len() >= cluster_count);
+    debug_assert_eq!(centroids_transposed.len(), VECTOR_DIMENSIONS * cluster_count);
+
+    unsafe {
+        let centroids_ptr = centroids_transposed.as_ptr();
+        let out_ptr = out.as_mut_ptr();
+
+        let q0 = _mm256_set1_ps(query[0]);
+        let mut cluster = 0usize;
+        while cluster + 8 <= cluster_count {
+            let centroid = _mm256_loadu_ps(centroids_ptr.add(cluster));
+            let delta = _mm256_sub_ps(centroid, q0);
+            _mm256_storeu_ps(out_ptr.add(cluster), _mm256_mul_ps(delta, delta));
+            cluster += 8;
+        }
+
+        while cluster < cluster_count {
+            let delta = *centroids_ptr.add(cluster) - query[0];
+            *out_ptr.add(cluster) = delta * delta;
+            cluster += 1;
+        }
+
+        for (dimension, &query_value) in query.iter().enumerate().skip(1) {
+            let qd = _mm256_set1_ps(query_value);
+            let base = dimension * cluster_count;
+            let mut cluster = 0usize;
+
+            while cluster + 8 <= cluster_count {
+                let centroid = _mm256_loadu_ps(centroids_ptr.add(base + cluster));
+                let delta = _mm256_sub_ps(centroid, qd);
+                let acc = _mm256_loadu_ps(out_ptr.add(cluster));
+                _mm256_storeu_ps(out_ptr.add(cluster), _mm256_fmadd_ps(delta, delta, acc));
+                cluster += 8;
+            }
+
+            while cluster < cluster_count {
+                let delta = *centroids_ptr.add(base + cluster) - query_value;
+                *out_ptr.add(cluster) += delta * delta;
+                cluster += 1;
+            }
+        }
+    }
+}
+
+#[inline]
+pub fn centroid_distances_scalar_f32(
+    query: &[f32; VECTOR_DIMENSIONS],
+    centroids_transposed: &[f32],
+    cluster_count: usize,
+    out: &mut [f32],
+) {
+    debug_assert!(out.len() >= cluster_count);
+    debug_assert_eq!(centroids_transposed.len(), VECTOR_DIMENSIONS * cluster_count);
+
+    for cluster in 0..cluster_count {
+        out[cluster] = 0.0;
+    }
+
+    for (dimension, &query_value) in query.iter().enumerate() {
+        let base = dimension * cluster_count;
+        for cluster in 0..cluster_count {
+            let delta = centroids_transposed[base + cluster] - query_value;
+            out[cluster] += delta * delta;
+        }
+    }
+}
+
+#[inline]
+pub fn centroid_distances_f32(
+    query: &[f32; VECTOR_DIMENSIONS],
+    centroids_transposed: &[f32],
+    cluster_count: usize,
+    out: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe { centroid_distances_avx2_f32(query, centroids_transposed, cluster_count, out) };
+    }
+
+    centroid_distances_scalar_f32(query, centroids_transposed, cluster_count, out)
 }
 
 #[cfg(test)]
@@ -276,13 +361,11 @@ mod tests {
 
         #[cfg(target_arch = "x86_64")]
         {
-            if std::arch::is_x86_feature_detected!("avx2") {
-                let avx2_result = unsafe { distance_squared_avx2(&query, &reference) };
-                assert_eq!(
-                    scalar_result, avx2_result,
-                    "AVX2 and scalar results must match exactly"
-                );
-            }
+            let avx2_result = unsafe { distance_squared_avx2(&query, &reference) };
+            assert_eq!(
+                scalar_result, avx2_result,
+                "AVX2 and scalar results must match exactly"
+            );
         }
 
         // Verify correctness: (150-100)² + (250-200)² + ... = 50² × 14 = 35000
@@ -298,10 +381,8 @@ mod tests {
 
         #[cfg(target_arch = "x86_64")]
         {
-            if std::arch::is_x86_feature_detected!("avx2") {
-                let avx2_result = unsafe { distance_squared_avx2(&vector, &vector) };
-                assert_eq!(avx2_result, 0);
-            }
+            let avx2_result = unsafe { distance_squared_avx2(&vector, &vector) };
+            assert_eq!(avx2_result, 0);
         }
     }
 
@@ -320,10 +401,8 @@ mod tests {
 
         #[cfg(target_arch = "x86_64")]
         {
-            if std::arch::is_x86_feature_detected!("avx2") {
-                let avx2_result = unsafe { distance_squared_avx2(&query, &reference) };
-                assert_eq!(result, avx2_result);
-            }
+            let avx2_result = unsafe { distance_squared_avx2(&query, &reference) };
+            assert_eq!(result, avx2_result);
         }
     }
 
@@ -349,17 +428,15 @@ mod tests {
 
         #[cfg(target_arch = "x86_64")]
         {
-            if std::arch::is_x86_feature_detected!("avx2") {
-                let avx2_below = unsafe {
-                    distance_squared_with_threshold_avx2(&query, &reference, 30000)
-                };
-                assert_eq!(avx2_below, i32::MAX);
+            let avx2_below = unsafe {
+                distance_squared_with_threshold_avx2(&query, &reference, 30000)
+            };
+            assert_eq!(avx2_below, i32::MAX);
 
-                let avx2_above = unsafe {
-                    distance_squared_with_threshold_avx2(&query, &reference, 40000)
-                };
-                assert_eq!(avx2_above, full_distance);
-            }
+            let avx2_above = unsafe {
+                distance_squared_with_threshold_avx2(&query, &reference, 40000)
+            };
+            assert_eq!(avx2_above, full_distance);
         }
     }
 
@@ -380,11 +457,9 @@ mod tests {
 
         #[cfg(target_arch = "x86_64")]
         {
-            if std::arch::is_x86_feature_detected!("avx2") {
-                let avx2_distances =
-                    unsafe { distance_squared_block_with_threshold_avx2(&query, &block, i32::MAX) };
-                assert_eq!(avx2_distances, block_distances);
-            }
+            let avx2_distances =
+                unsafe { distance_squared_block_with_threshold_avx2(&query, &block, i32::MAX) };
+            assert_eq!(avx2_distances, block_distances);
         }
     }
 }

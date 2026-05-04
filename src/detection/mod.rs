@@ -78,6 +78,7 @@ struct OwnedDataset {
 #[derive(Debug, Clone, Copy)]
 struct SearchConfig {
     nprobe: Option<usize>,
+    fast_nprobe: Option<usize>,
 }
 
 #[derive(Debug)]

@@ -80,6 +80,7 @@ impl FraudEngine {
 fn load_search_config() -> Result<SearchConfig, FraudEngineError> {
     Ok(SearchConfig {
         nprobe: load_optional_env_usize("RINHA_IVF_NPROBE")?,
+        fast_nprobe: load_optional_env_usize("RINHA_IVF_FAST_NPROBE")?,
     })
 }
 
